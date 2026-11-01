@@ -1,0 +1,697 @@
+import torch
+import re
+from config import DEVICE, CHARS_PER_SECOND
+from modules.llm_backends import get_backend
+from config import DEVICE, CHARS_PER_SECOND
+
+class Reformulator:
+    """
+    Unified LLM-based translator + reformulator.
+    Uses Qwen3-8B to translate and fit text to time constraints in a single pass.
+    Replaces the old NLLB + separate reformulation pipeline.
+    """
+    def __init__(self, backend_name="Qwen2.5-7B-Instruct"):
+        self.backend_name = backend_name
+        self.llm = None
+
+    def load_model(self):
+        if self.llm is not None:
+            if hasattr(self.llm, "is_loaded") and self.llm.is_loaded():
+                return
+            if getattr(self.llm, "_backend", None) is not None:
+                return
+            if getattr(self.llm, "model", None) is not None:
+                return
+        self.llm = get_backend(self.backend_name)
+        self.llm.load()
+
+    def _language_name(self, lang_code):
+        """Convert language code or full name to human-readable English name."""
+        if not lang_code:
+            return "Unknown"
+        code = str(lang_code).strip().lower()
+        names = {
+            "french": "French", "english": "English", "spanish": "Spanish",
+            "german": "German", "italian": "Italian", "portuguese": "Portuguese",
+            "japanese": "Japanese", "korean": "Korean", "chinese": "Chinese",
+            "russian": "Russian", "arabic": "Arabic", "hindi": "Hindi",
+            "dutch": "Dutch", "polish": "Polish", "turkish": "Turkish",
+            "swedish": "Swedish", "czech": "Czech", "romanian": "Romanian",
+            "hungarian": "Hungarian", "burmese": "Burmese", "danish": "Danish",
+            "finnish": "Finnish", "greek": "Greek", "hebrew": "Hebrew",
+            "indonesian": "Indonesian", "khmer": "Khmer", "lao": "Lao",
+            "malay": "Malay", "norwegian": "Norwegian", "swahili": "Swahili",
+            "tagalog": "Tagalog", "thai": "Thai", "vietnamese": "Vietnamese"
+        }
+        if code in names:
+            return names[code]
+
+        name_map = {
+            "fra": "French", "eng": "English", "spa": "Spanish",
+            "deu": "German", "ita": "Italian", "por": "Portuguese",
+            "jpn": "Japanese", "kor": "Korean", "zho": "Chinese",
+            "rus": "Russian", "arb": "Arabic", "hin": "Hindi",
+            "nld": "Dutch", "pol": "Polish", "tur": "Turkish",
+            "swe": "Swedish", "ces": "Czech", "ron": "Romanian",
+            "hun": "Hungarian", "mya": "Burmese", "dan": "Danish",
+            "fin": "Finnish", "ell": "Greek", "heb": "Hebrew",
+            "ind": "Indonesian", "khm": "Khmer", "lao": "Lao",
+            "zsm": "Malay", "nob": "Norwegian", "swh": "Swahili",
+            "tgl": "Tagalog", "tha": "Thai", "vie": "Vietnamese",
+            "fr": "French", "en": "English", "es": "Spanish", 
+            "de": "German", "it": "Italian", "pt": "Portuguese", 
+            "ja": "Japanese", "ko": "Korean", "zh": "Chinese", 
+            "ru": "Russian", "ar": "Arabic", "hi": "Hindi", 
+            "nl": "Dutch", "pl": "Polish", "tr": "Turkish", 
+            "sv": "Swedish", "cs": "Czech", "ro": "Romanian", 
+            "hu": "Hungarian", "my": "Burmese", "da": "Danish",
+            "fi": "Finnish", "el": "Greek", "he": "Hebrew",
+            "id": "Indonesian", "km": "Khmer", "lo": "Lao",
+            "ms": "Malay", "no": "Norwegian", "sw": "Swahili",
+            "tl": "Tagalog", "th": "Thai", "vi": "Vietnamese"
+        }
+        for prefix, name in name_map.items():
+            if code.startswith(prefix):
+                return name
+        return "Unknown"
+
+    def _source_language_name(self, lang_code):
+        """Get source language name from Whisper-style codes or full names."""
+        return self._language_name(lang_code)
+
+    def _generate(self, messages, max_new_tokens=120, multiline=False):
+        """Run LLM generation with standard settings."""
+        self.load_model()
+        response = self.llm.generate(
+            messages,
+            max_new_tokens=max_new_tokens,
+            temperature=0.3,
+            do_sample=True,
+            repetition_penalty=1.05,
+            multiline=multiline
+        )
+        return self._clean_response(response, multiline)
+
+    def _clean_response(self, response: str, multiline: bool = False) -> str:
+        """Apply all post-processing to a raw LLM response."""
+        # Strip <think> blocks (Qwen3 reasoning artifacts)
+        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL|re.IGNORECASE).strip()
+        response = re.sub(r'<think>.*', '', response, flags=re.DOTALL|re.IGNORECASE).strip()
+        response = response.replace('<think>', '').replace('</think>', '').strip()
+        
+        # Strip DeepSeek/Qwen3 textual thinking blocks
+        response = re.sub(r'Thinking Process:.*?(?=\n\n|\Z)', '', response, flags=re.DOTALL|re.IGNORECASE).strip()
+        response = re.sub(r'Thinking Process:.*', '', response, flags=re.DOTALL|re.IGNORECASE).strip()
+        
+        # Strip LLM meta-comment lines ("Here's the translation:", "Translated:", etc.)
+        _META_PATTERNS = [
+            r"^here'?s?\s+(the|my|a)?\s*(translated|translation).*?:\s*",
+            r"^translation\s*:\s*",
+            r"^translated\s*(sentence|text)?\s*:\s*",
+            r"^voici\s+(la|ma)?\s*traduction.*?:\s*",
+            r"^traduction\s*:\s*",
+            r"^перевод\s*:\s*",
+            r"^вот\s+(мой\s+)?перевод\s*:\s*",
+            r"^übersetzung\s*:\s*",
+            r"^hier\s+ist\s+die\s+übersetzung\s*:\s*",
+        ]
+        lines = response.strip().split('\n')
+        # If first line matches a meta-pattern, skip it
+        if len(lines) > 1:
+            for pat in _META_PATTERNS:
+                if re.match(pat, lines[0], re.IGNORECASE):
+                    lines = lines[1:]
+                    break
+        
+        if multiline:
+            result = '\n'.join(lines).strip()
+        else:
+            # Take first non-empty line, strip quotes
+            result = ''
+            for line in lines:
+                line = line.strip()
+                if line:
+                    result = line
+                    break
+        
+        for q in ['"', "'", '\u201c', '\u201d', '\u00ab', '\u00bb']:
+            if result.startswith(q) and result.endswith(q):
+                result = result[1:-1].strip()
+        
+        # Strip orphan leading/trailing quotes (unpaired)
+        _all_quotes = '"\'\u201c\u201d\u00ab\u00bb'
+        while result and result[0] in _all_quotes:
+            result = result[1:].strip()
+        while result and result[-1] in _all_quotes:
+            result = result[:-1].strip()
+        
+        if not multiline:
+            # Strip markdown artifacts that LLM sometimes leaks
+            result = re.sub(r'^[\*]+\s*', '', result)   # leading asterisks
+            result = re.sub(r'\s*[\*]+$', '', result)   # trailing asterisks
+            result = result.replace('**', '').strip()    # bold markers
+        
+        # Final meta-comment check: if result IS a meta-comment, return empty
+        for pat in _META_PATTERNS:
+            if re.match(pat, result, re.IGNORECASE) and len(result) < 40:
+                return ''
+        
+        return result
+
+    def _build_translate_messages(self, text, source_lang, target_lang_code, duration, max_chars):
+        """Build messages + max_new_tokens for a translate_and_fit call (used for batching)."""
+        src_name = self._source_language_name(source_lang)
+        tgt_name = self._language_name(target_lang_code)
+        prompt = f"""You are an expert video dubbing translator. Translate from {src_name} to {tgt_name}.
+
+Source text: "{text}"
+Strict target duration: {duration:.1f}s -> translation MAX {max_chars} characters (spaces included).
+ABSOLUTE RULES:
+- Keep the core meaning, intent, and tone.
+- Natural spoken phrasing: if the source contains verbal hesitations, false starts, or self-corrections, translate the intended meaning cleanly and smoothly.
+- Preserve every detail, example, condition, cause-and-effect relation, and emotional meaning. Do not summarize or omit information. Use concise wording only when necessary to fit the timing.
+- Priority: fit strictly within {max_chars} characters while sounding 100% natural and idiomatic.
+- Output ONLY the {tgt_name} translation, nothing else.
+
+{tgt_name}:"""
+        messages = [
+            {"role": "system", "content": f"You are an expert video dubbing translator. Translate from {src_name} to {tgt_name} concisely while preserving all details and the complete meaning. Output: ONLY the {tgt_name} translation."},
+            {"role": "user", "content": prompt}
+        ]
+        return messages, max(15, int(max_chars * 1.2))
+
+    def translate_and_fit(self, text, source_lang, target_lang_code, duration, max_chars):
+        """
+        Translate text and fit it to time constraints in a single LLM pass.
+        Retries once with higher temperature if first attempt fails.
+        """
+        self.load_model()
+        
+        src_name = self._source_language_name(source_lang)
+        tgt_name = self._language_name(target_lang_code)
+        
+        # Same language? Just shorten if needed
+        if src_name == tgt_name:
+            if len(text) <= max_chars * 1.1:
+                return text
+            return self.shorten(text, max_chars, target_lang_code)
+        
+        for attempt in range(2):
+            prompt = f"""You are an expert video dubbing translator. Translate from {src_name} to {tgt_name}.
+
+Source text: "{text}"
+Strict target duration: {duration:.1f}s -> translation MAX {max_chars} characters (spaces included).
+ABSOLUTE RULES:
+- Keep the core meaning, intent, and tone.
+- Natural spoken phrasing: if the source contains verbal hesitations, false starts, or self-corrections, translate the intended meaning cleanly and smoothly.
+- Preserve every detail, example, condition, cause-and-effect relation, and emotional meaning. Do not summarize or omit information. Use concise wording only when necessary to fit the timing.
+- Priority: fit strictly within {max_chars} characters while sounding 100% natural and idiomatic.
+- Output ONLY the {tgt_name} translation, nothing else.
+
+{tgt_name}:"""
+
+            messages = [
+                {"role": "system", "content": f"You are an expert video dubbing translator. Translate from {src_name} to {tgt_name} concisely while preserving all details and the complete meaning. Output: ONLY the {tgt_name} translation."},
+                {"role": "user", "content": prompt}
+            ]
+            
+            result = self._generate(messages, max_new_tokens=max(15, int(max_chars * 1.2)))
+            
+            if not result or len(result) < 3:
+                if attempt == 0:
+                    print(f"  [RETRY] Empty result, retrying...")
+                    continue
+                return None
+            if result.strip() == text.strip():
+                if attempt == 0:
+                    print(f"  [RETRY] LLM returned source text unchanged, retrying...")
+                    continue
+                return None
+            
+            # Detect LLM leak: if result is clearly not target language or is a meta-comment
+            _leak_indicators = ["here's", "translated sentence", "translation:", "voici la"]
+            result_lower = result.lower()
+            leaked = False
+            for indicator in _leak_indicators:
+                if result_lower.startswith(indicator):
+                    print(f"  [WARN] LLM meta-leak detected: '{result[:50]}'")
+                    leaked = True
+                    break
+            if leaked:
+                if attempt == 0:
+                    continue
+                return None
+            
+            return result
+        
+        return None
+
+    def translate_segments(self, segments, source_lang, target_lang_name, 
+                           target_lang_code, cps, speed_factor=1.15):
+        """
+        Translate all segments with brutal concision for timing.
+        Uses GPU-batched inference (BATCH_SIZE=8) for ~5-8x speedup on 4090.
+        Failed/overflowed segments are retried individually.
+        """
+        tgt_name = self._language_name(target_lang_code)
+        src_name = self._source_language_name(source_lang)
+        same_lang = (src_name == tgt_name)
+        
+        if same_lang:
+            print(f"Same language ({src_name} -> {tgt_name}): preserving 100% authentic transcription.")
+            for seg in segments:
+                text = seg.get("text", "").strip()
+                seg["translated_text"] = text
+                seg["normal_text"] = text
+            return segments
+
+        self.load_model()
+        
+        BATCH_SIZE = 8
+        print(f"LLM Translation -> {tgt_name} ({len(segments)} segments, batch={BATCH_SIZE}, CPS={cps})...")
+
+        aggressive_cps = cps
+
+        for batch_start in range(0, len(segments), BATCH_SIZE):
+            batch = segments[batch_start:batch_start + BATCH_SIZE]
+
+            # --- Separate trivial (empty / same-lang) from segments needing LLM ---
+            pending_idx = []   # indices within batch that need LLM
+            batch_messages = []
+            batch_max_tokens = []
+            batch_meta = []    # (text, duration, max_chars) per pending segment
+
+            for local_i, seg in enumerate(batch):
+                text = seg.get("text", "").strip()
+                if not text:
+                    seg["translated_text"] = ""
+                    continue
+
+                duration = seg["end"] - seg["start"]
+                max_chars = int(duration * aggressive_cps * speed_factor)
+
+                if same_lang:
+                    # In same-language mode (e.g. French -> French), preserve the complete text intact.
+                    # Never brutally slice strings mid-word! Phase 2 (shorten_batch) will grammatically shorten overflowing segments if needed.
+                    seg["translated_text"] = text
+                    continue
+
+                msgs, mnt = self._build_translate_messages(text, source_lang, target_lang_code, duration, max_chars)
+                pending_idx.append(local_i)
+                batch_messages.append(msgs)
+                batch_max_tokens.append(mnt)
+                batch_meta.append((text, duration, max_chars))
+
+            if not batch_messages:
+                continue
+
+            # --- Single GPU call for the whole sub-batch ---
+            raw_responses = self.llm.generate_batch(
+                batch_messages, batch_max_tokens,
+                do_sample=True, temperature=0.3, repetition_penalty=1.05
+            )
+
+            # --- Post-process and validate each response ---
+            for local_i, raw, (text, duration, max_chars) in zip(pending_idx, raw_responses, batch_meta):
+                seg = batch[local_i]
+                result = self._clean_response(raw)
+
+                # Validate
+                is_empty   = not result or len(result) < 3
+                is_source  = result.strip() == text.strip()
+                is_leak    = any(result.lower().startswith(ind) for ind in ["here's", "translated sentence", "translation:", "voici la"])
+                is_overflow = result and len(result) > max_chars * 1.4
+
+                if is_empty or is_source or is_leak:
+                    # Individual retry via translate_and_fit (has its own 2-attempt loop)
+                    print(f"  [RETRY] Segment [{seg['start']:.1f}-{seg['end']:.1f}]: batch result invalid, retrying individually")
+                    result = self.translate_and_fit(text, source_lang, target_lang_code, duration, max_chars)
+
+                elif is_overflow:
+                    shorter_max = int(max_chars * 0.95)
+                    print(f"  [RETRY] Segment [{seg['start']:.1f}-{seg['end']:.1f}]: {len(result)} chars > {max_chars} limit, retrying with {shorter_max}")
+                    retry = self.translate_and_fit(text, source_lang, target_lang_code, duration, shorter_max)
+                    if retry and len(retry) < len(result):
+                        result = retry
+
+                if result:
+                    seg["translated_text"] = result
+                else:
+                    seg["translated_text"] = f"[TRANSLATION FAILED: {text}]"
+                    print(f"  [WARN] Segment [{seg['start']:.1f}-{seg['end']:.1f}]: LLM translation FAILED after retries")
+
+            done = min(batch_start + BATCH_SIZE, len(segments))
+            print(f"  {done}/{len(segments)} segments translated")
+
+        print(f"Translation complete: {len(segments)} segments")
+        return segments
+
+    def _build_normal_messages(self, text, src_name, tgt_name):
+        """Build messages + max_new_tokens for a translate_normal call (used for batching)."""
+        prompt = f"""Translate the following spoken text from {src_name} to {tgt_name}.
+Translate naturally, fluently, and faithfully into modern, idiomatic {tgt_name}.
+If the speaker hesitated or self-corrected mid-sentence, smooth it into a natural, clean sentence conveying the intended thought.
+Do NOT output robotic word-for-word translations of spoken slips. Output ONLY the {tgt_name} translation.
+
+Source: "{text}"
+
+{tgt_name}:"""
+        messages = [
+            {"role": "system", "content": f"You are a professional translator. Translate from {src_name} to {tgt_name} naturally and idiomatically. Output ONLY the translation."},
+            {"role": "user", "content": prompt}
+        ]
+        return messages, max(30, int(len(text) * 2))
+
+    def translate_normal(self, segments, source_lang, target_lang_code):
+        """
+        Translate all segments naturally without any length constraint.
+        Produces a faithful, full translation (no shortening, no concision).
+        Stores result in 'normal_text' key of each segment.
+        Uses GPU-batched inference (BATCH_SIZE=8) matching translate_segments.
+        """
+        src_name = self._source_language_name(source_lang)
+        tgt_name = self._language_name(target_lang_code)
+        same_lang = (src_name == tgt_name)
+
+        if same_lang:
+            for seg in segments:
+                seg["normal_text"] = seg.get("text", "").strip()
+            return segments
+
+        self.load_model()
+        BATCH_SIZE = 8
+        print(f"Normal Translation -> {tgt_name} ({len(segments)} segments, batch={BATCH_SIZE}, natural/full)...")
+        
+        for batch_start in range(0, len(segments), BATCH_SIZE):
+            batch = segments[batch_start:batch_start + BATCH_SIZE]
+
+            pending_idx = []
+            batch_messages = []
+            batch_max_tokens = []
+
+            for local_i, seg in enumerate(batch):
+                text = seg.get("text", "").strip()
+                if not text:
+                    seg["normal_text"] = ""
+                    continue
+                if same_lang:
+                    seg["normal_text"] = text
+                    continue
+                msgs, mnt = self._build_normal_messages(text, src_name, tgt_name)
+                pending_idx.append(local_i)
+                batch_messages.append(msgs)
+                batch_max_tokens.append(mnt)
+
+            if not batch_messages:
+                continue
+
+            raw_responses = self.llm.generate_batch(
+                batch_messages, batch_max_tokens,
+                do_sample=False, temperature=0.0, repetition_penalty=1.0
+            )
+
+            for local_i, raw in zip(pending_idx, raw_responses):
+                seg = batch[local_i]
+                text = seg.get("text", "").strip()
+                result = self._clean_response(raw, multiline=False)
+
+                if result and len(result) >= 3 and result.strip() != text.strip():
+                    seg["normal_text"] = result
+                else:
+                    # Individual retry on failure
+                    msgs, mnt = self._build_normal_messages(text, src_name, tgt_name)
+                    retry = self._generate(msgs, max_new_tokens=mnt)
+                    if retry and len(retry) >= 3 and retry.strip() != text.strip():
+                        seg["normal_text"] = retry
+                    else:
+                        fitted = seg.get("translated_text", "")
+                        if fitted and not fitted.startswith("[TRANSLATION FAILED"):
+                            seg["normal_text"] = fitted
+                            print(f"  [WARN] Normal translation failed [{seg['start']:.1f}-{seg['end']:.1f}], using fitted version")
+                        else:
+                            seg["normal_text"] = f"[TRANSLATION FAILED: {text}]"
+                            print(f"  [WARN] Normal translation FAILED [{seg['start']:.1f}-{seg['end']:.1f}], no fallback")
+
+            done = min(batch_start + BATCH_SIZE, len(segments))
+            print(f"  {done}/{len(segments)} segments translated (normal)")
+
+        print(f"Normal translation complete: {len(segments)} segments")
+        return segments
+
+    def shorten(self, text, target_chars, language):
+        """
+        Shorten text using LLM to fit within target_chars.
+        Used as fallback or for same-language reformulation.
+        """
+        self.load_model()
+        
+        lang_name = self._language_name(language)
+        
+        if lang_name == "French":
+            examples = (
+                'Exemple: "Maintenant, essayons de le tester." → "Essayons de le tester."\n'
+                'Exemple: "Nous allons mettre en place notre application." → "On met en place l\'appli."\n'
+                'Exemple: "Merci d\'avoir regardé jusqu\'à la fin." → "Merci d\'avoir regardé."\n'
+            )
+        elif lang_name == "English":
+            examples = (
+                'Example: "Now let\'s test it out and see." → "Let\'s test it out."\n'
+                'Example: "We\'ll set up our app and player." → "We set up the app and player."\n'
+            )
+        else:
+            examples = ""
+
+        prompt = f"""Shorten this {lang_name} sentence to {target_chars} characters or fewer.
+
+Rules:
+- Output ONLY the shortened sentence in {lang_name}
+- Must be grammatically complete, natural, and make sense as a spoken subtitle
+- Preserve every detail, example, condition, cause-and-effect relation, and emotional meaning. Do not summarize or omit information.
+- Use shorter wording only when absolutely necessary, without removing any detail or idea.
+- NEVER abbreviate words into incomplete non-words (NEVER write "unq.", "gouvern.", "maj."). Every word MUST be a real, full dictionary word.
+- Do NOT translate to another language
+
+{examples}Sentence ({len(text)} chars): {text}
+Shortened ({target_chars} chars max):"""
+
+        messages = [
+            {"role": "system", "content": f"You adapt {lang_name} subtitles to fit timing while preserving every detail and the complete meaning. Never summarize, omit information, cut words, or use abbreviations. Output ONLY the result."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        result = self._generate(messages, max_new_tokens=min(80, len(text)))
+        
+        # Validation: reject empty, longer, or truncated abbreviation words
+        if not result or len(result) < 3 or len(result) >= len(text):
+            return None
+        if len(result) > target_chars * 1.3:
+            return None
+        
+        # Reject if numbers were present in original text but completely omitted in result
+        if re.search(r'\d+', text) and not re.search(r'\d+', result):
+            return None
+
+        # Reject if any word (including the last one) is an obvious truncated non-word or clipped month/word
+        bad_words = {"unq", "unq.", "gouvern", "gouvern.", "maj", "maj.", "nov", "nov.", "dec", "déc.", "janv", "janv.", "févr", "févr."}
+        words_res = result.strip().split()
+        for w in words_res:
+            w_clean = w.lower().rstrip(',;:')
+            if w_clean in bad_words:
+                return None
+            if w.endswith(".") and len(w) > 2 and w_clean not in ["etc.", "m.", "mme.", "dr.", "st."] and w != words_res[-1]:
+                return None
+        
+        return result
+
+    def shorten_batch(self, items: list, language: str, batch_size: int = 8) -> list:
+        """
+        Batched version of shorten() for processing multiple overflowing segments in parallel.
+        items: list of (text, target_chars) tuples
+        Returns: list of shortened strings (or None for segments where shortening failed)
+        Uses exact same prompts and validation rules as shorten().
+        """
+        if not items:
+            return []
+
+        self.load_model()
+        lang_name = self._language_name(language)
+
+        if lang_name == "French":
+            examples = (
+                'Exemple: "Maintenant, essayons de le tester." → "Essayons de le tester."\n'
+                'Exemple: "Nous allons mettre en place notre application." → "On met en place l\'appli."\n'
+                'Exemple: "Merci d\'avoir regardé jusqu\'à la fin." → "Merci d\'avoir regardé."\n'
+            )
+        elif lang_name == "English":
+            examples = (
+                'Example: "Now let\'s test it out and see." → "Let\'s test it out."\n'
+                'Example: "We\'ll set up our app and player." → "We set up the app and player."\n'
+            )
+        else:
+            examples = ""
+
+        all_results = []
+
+        for b_start in range(0, len(items), batch_size):
+            sub_items = items[b_start:b_start + batch_size]
+            batch_messages = []
+            batch_max_tokens = []
+            valid_sub_indices = []
+
+            for i, (text, target_chars) in enumerate(sub_items):
+                if not text or len(text.strip()) < 3:
+                    continue
+
+                prompt = f"""Shorten this {lang_name} sentence to {target_chars} characters or fewer.
+
+Rules:
+- Output ONLY the shortened sentence in {lang_name}
+- Must be grammatically complete, natural, and make sense as a spoken subtitle
+- Preserve every detail, example, condition, cause-and-effect relation, and emotional meaning. Do not summarize or omit information.
+- Use shorter wording only when absolutely necessary, without removing any detail or idea.
+- NEVER abbreviate words into incomplete non-words (NEVER write "unq.", "gouvern.", "maj."). Every word MUST be a real, full dictionary word.
+- Do NOT translate to another language
+
+{examples}Sentence ({len(text)} chars): {text}
+Shortened ({target_chars} chars max):"""
+
+                messages = [
+                    {"role": "system", "content": f"You adapt {lang_name} subtitles to fit timing while preserving every detail and the complete meaning. Never summarize, omit information, cut words, or use abbreviations. Output ONLY the result."},
+                    {"role": "user", "content": prompt}
+                ]
+                batch_messages.append(messages)
+                batch_max_tokens.append(min(80, max(15, len(text))))
+                valid_sub_indices.append(i)
+
+            sub_results = [None] * len(sub_items)
+
+            if batch_messages:
+                if hasattr(self.llm, "generate_batch"):
+                    raw_responses = self.llm.generate_batch(
+                        batch_messages, batch_max_tokens,
+                        do_sample=True, temperature=0.3, repetition_penalty=1.05
+                    )
+                else:
+                    raw_responses = [
+                        self._generate(m, max_new_tokens=t)
+                        for m, t in zip(batch_messages, batch_max_tokens)
+                    ]
+
+                for raw, sub_idx in zip(raw_responses, valid_sub_indices):
+                    text, target_chars = sub_items[sub_idx]
+                    result = self._clean_response(raw)
+
+                    # Exact same validation as shorten()
+                    is_valid = (
+                        result
+                        and len(result) >= 3
+                        and len(result) < len(text)
+                        and len(result) <= target_chars * 1.3
+                    )
+
+                    if is_valid:
+                        if re.search(r'\d+', text) and not re.search(r'\d+', result):
+                            is_valid = False
+
+                    if is_valid:
+                        bad_words = {"unq", "unq.", "gouvern", "gouvern.", "maj", "maj.", "nov", "nov.", "dec", "déc.", "janv", "janv.", "févr", "févr."}
+                        words_res = result.strip().split()
+                        for w in words_res:
+                            w_clean = w.lower().rstrip(',;:')
+                            if w_clean in bad_words:
+                                is_valid = False
+                                break
+                            if w.endswith(".") and len(w) > 2 and w_clean not in ["etc.", "m.", "mme.", "dr.", "st."] and w != words_res[-1]:
+                                is_valid = False
+                                break
+
+                    if not is_valid:
+                        result = None
+
+                    sub_results[sub_idx] = result if (result and len(result) < len(text)) else None
+
+            all_results.extend(sub_results)
+
+        return all_results
+
+    def check_timing_batch(self, segments, language_family="default"):
+        """Estimate and flag segments that are too long."""
+        cps = CHARS_PER_SECOND.get(language_family, 13)
+        for seg in segments:
+            text = seg.get("translated_text", seg.get("text", ""))
+            duration = seg["end"] - seg["start"]
+            estimated_duration = len(text) / cps
+            seg["estimated_too_long"] = estimated_duration > (duration * 1.2)
+        return segments
+
+    def translate_text(self, text, source_lang_code, target_lang_code):
+        """Translate a generic text (like a video title or description)."""
+        if not text or not text.strip():
+            return ""
+        target_lang = self._language_name(target_lang_code)
+        source_lang = self._source_language_name(source_lang_code)
+        if source_lang == target_lang:
+            return text
+        self.load_model()
+        
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"You are an expert native translator and localization specialist for YouTube content. "
+                    f"Translate the user's text from {source_lang} to {target_lang}.\n"
+                    f"CRITICAL RULES:\n"
+                    f"- Output ONLY the translated text, nothing else.\n"
+                    f"- DO NOT output your internal reasoning, thinking process, notes, quotes, or preambles.\n"
+                    f"- DO NOT use markdown bold asterisks (**) anywhere in the output.\n"
+                    f"- Use natural {target_lang} sentence casing (do NOT capitalize every single word).\n"
+                    f"- Keep the tone engaging, natural, and idiomatic for YouTube titles, chapters, and descriptions.\n"
+                    f"- PRESERVE EXACTLY all URLs, links, social media handles, emojis, and line break formatting.\n"
+                    f"- Translate relevant hashtags naturally into {target_lang} while keeping brand names intact (#DragonBall, #Nikolatoy, #Goku, #Kamehameha).\n"
+                    f"- Do not alter or translate website URLs, affiliate links, or channel handles."
+                )
+            },
+            {"role": "user", "content": text}
+        ]
+        
+        result = self._generate(messages, max_new_tokens=4096, multiline=True)
+        if result:
+            # Strip any markdown bold asterisks
+            result = re.sub(r"\*\*([^*]+)\*\*", r"\1", result)
+            result = re.sub(r"\*([^*]+)\*", r"\1", result).strip()
+        return result if result else ""
+
+    def fit_segments(self, segments, cps=CHARS_PER_SECOND, target_lang=None, progress=None):
+        """
+        Fit translated segments to speech timing constraints.
+        Returns (segments, reformulated_count).
+        """
+        if not segments:
+            return segments, 0
+        reformulated_count = 0
+        lang_code = target_lang or "en"
+        for seg in segments:
+            text = seg.get("translated_text", "")
+            duration = seg.get("end", 0) - seg.get("start", 0)
+            max_chars = int(duration * cps * 1.25)
+            if len(text) > max_chars * 1.1 and text.strip():
+                try:
+                    shortened = self.shorten(text, max_chars, lang_code)
+                    if shortened and len(shortened) < len(text):
+                        seg["translated_text"] = shortened
+                        seg["reformulated"] = True
+                        reformulated_count += 1
+                except Exception:
+                    pass
+        return segments, reformulated_count
+
+    def cleanup(self):
+        if self.llm is not None:
+            self.llm.unload()
+            self.llm = None
+
+if __name__ == "__main__":
+    r = Reformulator()
+    # r.load_model() # Heavy to load
+    text = "In this full Python game development course, you will learn how to code a playable Minecraft clone."
+    # print(r.translate_and_fit(text, "en", "fra_Latn", 3.5, 50))

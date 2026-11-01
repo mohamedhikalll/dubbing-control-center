@@ -1,0 +1,23 @@
+# Install into the existing Python 3.12 environment. These CUDA builds are intentional.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
+torchvision==0.23.0+cu128
+fsspec==2025.3.0
+
+# Local dubbing pipeline
+git+https://github.com/m-bain/whisperX.git
+git+https://github.com/huggingface/transformers.git
+sentencepiece
+protobuf
+demucs>=4.0.0
+pydub>=0.25.1
+soundfile>=0.12.0
+librosa>=0.10.0
+numpy>=2.2.2
+ffmpeg-python>=0.2.0
+accelerate>=0.25.0
+bitsandbytes>=0.43.0
+voxcpm>=2.0.2
+scenedetect>=0.7.1
+opencv-python>=4.8.0

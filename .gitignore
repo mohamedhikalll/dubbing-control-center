@@ -1,0 +1,43 @@
+# Python / environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# Model and generated artifacts
+models/
+output/
+outputs/
+temp/
+cache/
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.onnx
+*.gguf
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.mkv
+*.flac
+*.opus
+*.aac
+*.srt
+*.log
+*.tmp
+*.partial.*
+
+# Per-user settings / credentials
+.env
+.env.*
+!.env.example
+last_session.json
+profiles.json
+profiles_menu.json
+*.pem
+*.key
