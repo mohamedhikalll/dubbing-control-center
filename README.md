@@ -33,11 +33,44 @@
 
 ## التثبيت الأولي
 
-1. ثبّت Python 3.12 وFFmpeg/FFprobe، وتأكد أن `ffmpeg -version` و`ffprobe -version` يعملان من CMD.
-2. افتح CMD داخل مجلد المشروع، ثم نفّذ `py -3.12 -m venv env` وبعده `env\Scripts\activate`.
-3. راجع `requirements.txt` قبل التثبيت؛ يتضمن PyTorch CUDA 12.8 وروابط اعتماد Git متغيرة. ثبّت التبعيات على مسؤوليتك وبعد التأكد من توافق CUDA والنظام لديك: `python -m pip install -r requirements.txt`.
-4. شغّل `dub.bat --check` لفحص متطلبات التشغيل وCUDA. عند بدء أول مهمة، ينزّل التطبيق تلقائيًا النماذج التي لا يجدها في الكاش (مثل Whisper والمحاذاة وLLM وTTS، بحسب المهمة والإعدادات). أبقِ الإنترنت متاحًا حتى يكتمل التنزيل؛ قد تكون الملفات كبيرة وتتطلب مساحة قرص واتصالًا مستقرًا. تُخزّن النماذج محليًا لإعادة استخدامها لاحقًا. إذا كان الجهاز بلا إنترنت، فلن يمكن تنزيل نموذج مفقود في تلك اللحظة.
-5. أضف فقط تسجيلًا مرجعيًا تملك حق استخدامه إلى `voices/` إذا كان إعداد الصوت يتطلب ذلك. لا ترفع التسجيلات إلى GitHub.
+الأوامر التالية لـ **CMD** في Windows 10/11. يلزم وجود WinGet؛ اختبره بكتابة `winget --version`. إذا لم يتعرف Windows على الأمر، ثبّت **App Installer** من Microsoft Store ثم افتح CMD جديدًا. ثبّت كل برنامج فقط إذا لم يكن موجودًا بالفعل:
+
+```bat
+winget install --id Python.Python.3.12 -e --no-upgrade
+winget install --id Gyan.FFmpeg -e --no-upgrade
+winget install --id Git.Git -e --no-upgrade
+```
+
+Python مطلوب لتشغيل التطبيق. حزمة FFmpeg توفر `ffmpeg` و`ffprobe` اللذين يستخدمهما لمعالجة الوسائط. Git مطلوب لأن بعض المكتبات في `requirements.txt` تُثبّت مباشرة من مستودعات GitHub. الأوامر تستعمل Winget ومعرّفات الحزم الدقيقة؛ راجع [طريقة Winget الرسمية](https://learn.microsoft.com/en-us/windows/package-manager/winget/install)، و[حزمة Python 3.12](https://winstall.app/apps/Python.Python.3.12)، و[حزمة FFmpeg](https://winstall.app/apps/Gyan.FFmpeg)، و[حزمة Git](https://winstall.app/apps/Git.Git).
+
+بعد التثبيت، أغلق CMD وافتحه من جديد، ثم تحقق من الأدوات:
+
+```bat
+py -3.12 --version
+git --version
+ffmpeg -version
+ffprobe -version
+```
+
+للتشغيل على NVIDIA، ثبّت تعريف بطاقة NVIDIA المتوافق من [صفحة التنزيل الرسمية](https://www.nvidia.com/Download/index.aspx)، ثم أعد تشغيل Windows إذا طلب المثبّت ذلك. تحقق من ظهوره بالأمر `nvidia-smi`. ملف المتطلبات يثبت PyTorch المجهّز بـCUDA 12.8؛ عادةً لا تحتاج إلى تثبيت CUDA Toolkit كامل يدويًا لهذا الإعداد، لكنك تحتاج تعريف NVIDIA حديثًا ومتوافقًا. هذه النسخة موجّهة إلى بيئة CUDA كما هو مثبت في `requirements.txt`.
+
+افتح CMD وانتقل إلى مجلد المشروع الذي فككت ضغطه؛ غيّر المسار إذا اخترت مجلدًا آخر:
+
+```bat
+cd /d C:\Dubbing
+py -3.12 -m venv env
+call env\Scripts\activate.bat
+python -m pip install --upgrade pip wheel
+python -m pip install -r requirements.txt
+```
+
+الأمر الأخير يثبت PyTorch وبقية مكتبات Python للمشروع. قد يستغرق وقتًا وينزّل ملفات كبيرة. بعد اكتماله، افحص البيئة:
+
+```bat
+dub.bat --check
+```
+
+عند بدء أول مهمة، ينزّل التطبيق تلقائيًا النماذج التي لا يجدها في الكاش (مثل Whisper والمحاذاة وLLM وTTS، بحسب المهمة والإعدادات). أبقِ الإنترنت متاحًا حتى يكتمل التنزيل؛ تحتاج الملفات الكبيرة إلى مساحة قرص واتصال مستقر، ثم تُخزّن محليًا لإعادة استخدامها. إذا لم يكن `winget` متاحًا، استخدم التنزيلات الرسمية: [Python 3.12](https://www.python.org/downloads/)، و[FFmpeg for Windows](https://www.gyan.dev/ffmpeg/builds/)، و[Git for Windows](https://git-scm.com/download/win). أضف فقط تسجيلًا مرجعيًا تملك حق استخدامه إلى `voices/` إذا تطلب إعداد الصوت ذلك، ولا ترفع التسجيلات إلى GitHub.
 
 ## الاستخدام
 
