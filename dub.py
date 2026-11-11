@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -16,6 +16,7 @@ from long_video_pipeline.translation_stage import run_translation_stage
 from long_video_pipeline.dubbing_stage import run_dubbing_stage
 from long_video_pipeline.splitter import load_manifest
 from modules.video_assembler import VideoAssembler
+from modules.srt_parser import SRTParser
 from config import MAX_SPEED_FACTOR
 import modules.time_sync as time_sync_module
 
@@ -27,6 +28,53 @@ def timestamp(seconds: float) -> str:
     total = int(round(max(0.0, seconds) * 1000))
     h, rem = divmod(total, 3600000); m, rem = divmod(rem, 60000); s, ms = divmod(rem, 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def seed_external_srt(job, srt_path: Path, chunks: list[ChunkInfo]) -> int:
+    """Create the pipeline checkpoints from an existing, timed SRT file."""
+    segments = SRTParser().parse_srt(str(srt_path))
+    if not segments:
+        raise RuntimeError(f"External SRT contains no readable cues: {srt_path}")
+    total = 0
+    for chunk in chunks:
+        chunk_segments = []
+        for item in segments:
+            start = max(float(item["start"]), float(chunk.start))
+            end = min(float(item["end"]), float(chunk.end))
+            if end <= start:
+                continue
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            row = {
+                "index": len(chunk_segments) + 1,
+                "start": start - float(chunk.start),
+                "end": end - float(chunk.start),
+                "text": text,
+                "normal_text": text,
+                "fitted_text": text,
+                "translated_text": text,
+            }
+            chunk_segments.append(row)
+        if not chunk_segments:
+            continue
+        payload = {"segments": chunk_segments, "language": "external-srt"}
+        transcription_path = job.path_for_chunk(job.transcription_dir, chunk.number, ".json")
+        translation_path = job.path_for_chunk(job.translation_dir, chunk.number, ".json")
+        transcription_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        translation_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        chunk_srt = job.transcription_dir / f"chunk_{chunk.number:03d}.srt"
+        chunk_srt_text = "\n".join(
+            f"{i}\n{timestamp(row['start'])} --> {timestamp(row['end'])}\n{row['text']}\n"
+            for i, row in enumerate(chunk_segments, 1)
+        )
+        chunk_srt.write_text(chunk_srt_text, encoding="utf-8")
+        for suffix in ("_normal.srt", "_fitted.srt"):
+            (job.translation_dir / f"chunk_{chunk.number:03d}{suffix}").write_text(chunk_srt_text, encoding="utf-8")
+        total += len(chunk_segments)
+    if total <= 0:
+        raise RuntimeError("External SRT has no cues inside the input media duration.")
+    return total
 
 
 def write_full_srt(job, target_path: Path, key: str = "text") -> int:
@@ -246,8 +294,9 @@ def main() -> int:
     p.add_argument("--whisper", default="large-v3"); p.add_argument("--whisper-batch-size", type=int, choices=[1, 2, 4, 8], default=4)
     p.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--gender", default="Man", choices=["Man", "Woman"]); p.add_argument("--reference-audio")
+    p.add_argument("--external-srt", help="Use this existing SRT as the dubbing text and timings")
     p.add_argument("--output", default="video", choices=["video", "audio"])
-    p.add_argument("--task", choices=["full", "split", "transcribe", "translate", "dub"], default="full")
+    p.add_argument("--task", choices=["full", "split", "transcribe", "translate", "translate_srt", "bilingual_srt", "dub", "srt_dub"], default="full")
     p.add_argument("--text-mode", choices=["auto", "normal", "fitted"], default="normal")
     p.add_argument("--split-mode", choices=["auto", "never", "always"], default="auto")
     p.add_argument("--chunk-minutes", type=float, default=10.0); p.add_argument("--split-threshold-seconds", type=float, default=1140.0)
@@ -263,6 +312,10 @@ def main() -> int:
         raise SystemExit(f"ERROR: Local input file not found: {source}")
     if args.reference_audio and (urlparse(args.reference_audio).scheme.lower() in {"http", "https"} or not Path(args.reference_audio).expanduser().is_file()):
         raise SystemExit("ERROR: Reference audio must be an existing local file.")
+    if args.external_srt and (urlparse(args.external_srt).scheme.lower() in {"http", "https"} or not Path(args.external_srt).expanduser().is_file()):
+        raise SystemExit("ERROR: External SRT must be an existing local file.")
+    if args.task == "srt_dub" and not args.external_srt:
+        raise SystemExit("ERROR: --task srt_dub requires --external-srt.")
     if not 1.0 <= args.max_speed <= 2.5:
         raise SystemExit("ERROR: --max-speed must be between 1.0 and 2.5.")
     os.environ["ZAST_DEVICE"] = args.device
@@ -336,8 +389,14 @@ def main() -> int:
         return 0
 
     lang = SOURCE_MAP[args.source_language]
-    transcription_valid = _valid_transcription_checkpoint(job, chunks)
-    translation_valid = _valid_translation_checkpoint(job, chunks)
+    if args.task == "srt_dub":
+        cue_count = seed_external_srt(job, Path(args.external_srt).expanduser().resolve(), chunks)
+        print(f"External SRT loaded: {cue_count} cue(s)")
+        transcription_valid = True
+        translation_valid = True
+    else:
+        transcription_valid = _valid_transcription_checkpoint(job, chunks)
+        translation_valid = _valid_translation_checkpoint(job, chunks)
     if job.is_stage_completed("transcribe") and not transcription_valid:
         state = job.load_state(); state["stages"]["transcribe"].update(status="pending", finished_at=None, error=None); job.save_state(state)
     if args.task in {"full", "transcribe"}:
@@ -361,7 +420,8 @@ def main() -> int:
         print(f"[LANGUAGE] Detected source language: {effective_source_lang}")
         job.set_settings(detected_source_language=effective_source_lang)
 
-    translation_valid = _valid_translation_checkpoint(job, chunks)
+    if args.task != "srt_dub":
+        translation_valid = _valid_translation_checkpoint(job, chunks)
     if args.task == "transcribe":
         cues = write_full_srt(job, job.final_dir / f"{source.stem}_source.srt", "text")
         if cues <= 0:
@@ -370,7 +430,7 @@ def main() -> int:
         print(f"Transcription ready: {job.final_dir / (source.stem + '_source.srt')}")
         return 0
 
-    if args.task in {"full", "translate"}:
+    if args.task in {"full", "translate", "translate_srt", "bilingual_srt"}:
         if job.is_stage_completed("translate") and not translation_valid:
             state = job.load_state(); state["stages"]["translate"].update(status="pending", finished_at=None, error=None); job.save_state(state)
         if not job.is_stage_completed("translate") or not translation_valid:
@@ -389,7 +449,7 @@ def main() -> int:
     srt_counts["bilingual_en_ar"] = write_bilingual_srt(job, final / f"{source.stem}_bilingual_en_ar.srt", bilingual_key)
     if any(count <= 0 for count in srt_counts.values()):
         raise RuntimeError(f"SRT validation failed; cue counts: {srt_counts}")
-    if args.task == "translate":
+    if args.task in {"translate", "translate_srt", "bilingual_srt"}:
         selected_key = "fitted_text" if args.text_mode == "fitted" else "normal_text"
         selected_cues = write_full_srt(job, final / f"{source.stem}_arabic.srt", selected_key)
         if selected_cues <= 0:

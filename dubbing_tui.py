@@ -39,7 +39,7 @@ def save_profiles(data): PROFILE_FILE.write_text(json.dumps(data,ensure_ascii=Fa
 
 
 def defaults():
-    settings = {"input":"","source_mode":"single","recursive":False,"source_language":"auto","target_language":"Arabic","target_code":"ar","llm":LLMS[0][1],"whisper":"large-v3","whisper_batch_size":4,"device":"cuda","gender":"Man","output":"video","reference_audio":"","split_mode":"auto","chunk_minutes":10.0,"split_threshold_seconds":1140.0,"search_window":30.0,"max_speed":2.5,"task":"full","text_mode":"normal"}
+    settings = {"input":"","source_mode":"single","recursive":False,"source_language":"auto","target_language":"Arabic","target_code":"ar","llm":LLMS[0][1],"whisper":"large-v3","whisper_batch_size":4,"device":"cuda","gender":"Man","output":"video","reference_audio":"","external_srt":"","split_mode":"auto","chunk_minutes":10.0,"split_threshold_seconds":1140.0,"search_window":30.0,"max_speed":2.5,"task":"full","text_mode":"normal"}
     try:
         saved = json.loads(LAST_SESSION_FILE.read_text(encoding="utf-8"))
         if isinstance(saved, dict):
@@ -140,6 +140,32 @@ def choose_profile(data, title):
 def _set_option(s,key,options,current): s[key]=options[choose("Edit "+key, [x[0] if isinstance(x,tuple) else str(x) for x in options], current)]
 
 
+def edit_reference_audio(s):
+    """Choose, replace, or explicitly clear the reference voice file."""
+    current = s.get("reference_audio") or ""
+    clear(); header()
+    print(CYAN+"\nReference audio"+RESET+"\n")
+    print(f"  Current: {GREEN}{current or 'Default voice'}{RESET}")
+    print(f"  {YELLOW}1{RESET}. Choose or replace reference audio")
+    print(f"  {YELLOW}2{RESET}. Remove reference audio (use default voice)")
+    print(f"  {YELLOW}3{RESET}. Keep current value")
+    while True:
+        answer = input("\nSelect number [1]: ").strip() or "1"
+        if answer == "1":
+            value = input("Reference audio path (type clear/none to remove): ").strip().strip('"')
+            if value.lower() in {"clear", "none", "default", "reset", "-"}:
+                s["reference_audio"] = ""
+            elif value:
+                s["reference_audio"] = value
+            return
+        if answer == "2":
+            s["reference_audio"] = ""
+            return
+        if answer == "3":
+            return
+        print(RED+"Invalid choice."+RESET)
+
+
 def edit(s, number):
     if number==1: s["input"]=prompt_text("Local media path, TXT list, or folder path",s["input"])
     elif number==2: s["source_mode"]=["single","list","folder"][choose("Input source type",["One local media file","TXT list (one path per line)","Folder containing media files"],["single","list","folder"].index(s["source_mode"]))]
@@ -153,7 +179,7 @@ def edit(s, number):
     elif number==8: s["device"]=["cuda","cpu"][choose("Device",["CUDA GPU","CPU"],0 if s["device"]=="cuda" else 1)]
     elif number==9: s["gender"]=["Man","Woman"][choose("Voice",["Man","Woman"],0 if s["gender"]=="Man" else 1)]
     elif number==10: s["output"]=["video","audio"][choose("Output",["Video + audio","Audio only"],0 if s["output"]=="video" else 1)]
-    elif number==11: s["reference_audio"]=prompt_text("Reference audio path (blank = default voice)",s["reference_audio"] or "")
+    elif number==11: edit_reference_audio(s)
     elif number==12: s["split_mode"]=["auto","never","always"][choose("Split mode",["Auto (threshold)","Never split","Always split"],["auto","never","always"].index(s["split_mode"]))]
     elif number==13:
         value=float(prompt_text("Maximum per-sentence speed (1.0-2.5)",str(s["max_speed"])))
@@ -163,8 +189,9 @@ def edit(s, number):
     elif number==15: s["chunk_minutes"]=float(prompt_text("Chunk target in minutes",str(s["chunk_minutes"])))
     elif number==16: s["search_window"]=float(prompt_text("Silence search window in seconds",str(s["search_window"])))
     elif number==17: s["whisper_batch_size"]=[1,2,4,8][choose("Whisper batch size",["1 (lowest VRAM)","2","4 (safe default)","8"],[1,2,4,8].index(s["whisper_batch_size"]))]
-    elif number==18: s["task"]=["full","split","transcribe","translate","dub"][choose("Operation",["Full pipeline","Split only","Extract/transcribe script only","Translate existing transcription only","Dub using existing translation only"],["full","split","transcribe","translate","dub"].index(s["task"]))]
-    elif number==19: s["text_mode"]=["auto","normal","fitted"][choose("Text used for dubbing",["Auto: Normal, speed-up, then Fitted fallback","Normal only (default)","Fitted only"],["auto","normal","fitted"].index(s["text_mode"]))]
+    elif number==18: s["task"]=["full","split","transcribe","translate_srt","bilingual_srt","dub","srt_dub"][choose("Operation",["Full pipeline","Split only","Extract/transcribe source SRT","Output translated SRT","Output bilingual EN + target SRT","Dub using generated translation","Dub using external SRT"],["full","split","transcribe","translate_srt","bilingual_srt","dub","srt_dub"].index(s["task"]))]
+    elif number==19: s["external_srt"]=prompt_text("External SRT path (used by SRT dubbing)",s.get("external_srt", ""))
+    elif number==20: s["text_mode"]=["auto","normal","fitted"][choose("Text used for dubbing",["Auto: Normal, speed-up, then Fitted fallback","Normal only (default)","Fitted only"],["auto","normal","fitted"].index(s["text_mode"]))]
 def render_menu(s):
     clear(); header(); print("\n"+WHITE+"Current settings"+RESET+"\n")
     rows = [
@@ -186,10 +213,11 @@ def render_menu(s):
         ("Silence search", f"{s['search_window']} sec"),
         ("Whisper batch size", str(s["whisper_batch_size"])),
         ("Operation", s["task"]),
+        ("External SRT", s.get("external_srt") or "Not selected"),
         ("Dubbing text mode", s["text_mode"]),
     ]
     for i,(label,value) in enumerate(rows,1): print(f"  {YELLOW}{i:2d}{RESET}. {label:<22} {GREEN}{value}{RESET}")
-    print(f"  {DIM}Automatic required output: <source>_bilingual_en_ar.srt (EN + Arabic) for translate/dub/full.{RESET}")
+    print(f"  {DIM}SRT output operations create translated and/or bilingual files in the final folder.{RESET}")
     print(f"\n  {GREEN}S{RESET}. Start selected operation\n  {CYAN}H{RESET}. Show operations and outputs\n  {CYAN}P{RESET}. Save profile\n  {CYAN}L{RESET}. Load profile\n  {CYAN}D{RESET}. Delete profile\n  {RED}0{RESET}. Exit")
 
 
@@ -208,6 +236,7 @@ def run(s):
     cmd += ["--source-language",s["source_language"],"--target-language",s["target_language"],"--target-code",s["target_code"],"--llm",s["llm"],"--whisper",s["whisper"],"--whisper-batch-size",str(s["whisper_batch_size"]),"--device",s["device"],"--gender",s["gender"],"--output",s["output"],"--split-mode",s["split_mode"],"--max-speed",str(s["max_speed"]),"--split-threshold-seconds",str(s["split_threshold_seconds"]),"--chunk-minutes",str(s["chunk_minutes"]),"--search-window",str(s["search_window"]),"--task",s["task"],"--text-mode",s["text_mode"]]
     if s["source_mode"]=="single": cmd += ["--log-file",str(log_path)]
     if s["reference_audio"]: cmd += ["--reference-audio",s["reference_audio"]]
+    if s.get("external_srt"): cmd += ["--external-srt",s["external_srt"]]
     check=subprocess.run([sys.executable,str(BASE/"dub_cli.py"),"--check","--whisper",s["whisper"]],cwd=BASE,text=True,encoding="utf-8",errors="replace",capture_output=True)
     check_text=(check.stdout or check.stderr).strip()
     destination_note=f"Workspace: {workspace}\nFinal output: {workspace/'final'}" if s["source_mode"]=="single" else "Batch mode: sequential; each input gets its own sibling <name>_dubbing\\final folder and run log."
@@ -312,7 +341,7 @@ def main():
             data=profiles(); name=choose_profile(data,"Delete profile")
             if name and input(f"Delete profile '{name}'? [y/N]: ").strip().lower()=="y": data.pop(name,None); save_profiles(data)
             continue
-        if choice.isdigit() and 1<=int(choice)<=19:
+        if choice.isdigit() and 1<=int(choice)<=20:
             try: edit(s,int(choice))
             except (ValueError,IndexError) as exc: print(RED+str(exc)+RESET); pause()
 

@@ -167,8 +167,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p.add_argument("--gender", choices=VOICES, default="Man")
     p.add_argument("--reference-audio")
+    p.add_argument("--external-srt", help="Use this existing SRT as the dubbing text and timings")
     p.add_argument("--output", choices=["video", "audio"], default="video")
-    p.add_argument("--task", choices=["full", "split", "transcribe", "translate", "dub"], default="full",
+    p.add_argument("--task", choices=["full", "split", "transcribe", "translate", "translate_srt", "bilingual_srt", "dub", "srt_dub"], default="full",
                    help="Run the complete job or one stage only")
     p.add_argument("--text-mode", choices=["auto", "normal", "fitted"], default="normal",
                    help="Text used for synthesis: auto fallback, normal only, or fitted only")
@@ -571,9 +572,13 @@ def _run(args: argparse.Namespace) -> int:
         raise SystemExit(f"ERROR: Local input file not found: {source}")
     if args.reference_audio and (_is_url(args.reference_audio) or not Path(args.reference_audio).expanduser().is_file()):
         raise SystemExit("ERROR: Reference audio must be an existing local file.")
+    if args.external_srt and (_is_url(args.external_srt) or not Path(args.external_srt).expanduser().is_file()):
+        raise SystemExit("ERROR: External SRT must be an existing local file.")
+    if args.task == "srt_dub" and not args.external_srt:
+        raise SystemExit("ERROR: --task srt_dub requires --external-srt.")
     if args.chunk_minutes <= 0 or args.split_threshold_seconds < 0 or args.search_window < 0:
         raise SystemExit("ERROR: Split settings must be positive (threshold may be zero).")
-    if args.redub and args.task not in {"full", "dub"}:
+    if args.redub and args.task not in {"full", "dub", "srt_dub"}:
         raise SystemExit("ERROR: --redub can only be used with --task full or --task dub.")
     if not 1.0 <= args.max_speed <= 2.5:
         raise SystemExit("ERROR: --max-speed must be between 1.0 and 2.5.")
@@ -595,6 +600,8 @@ def _run(args: argparse.Namespace) -> int:
            "--max-speed", str(args.max_speed), "--text-mode", args.text_mode]
     if args.reference_audio:
         base_cmd += ["--reference-audio", str(Path(args.reference_audio).expanduser().resolve())]
+    if args.external_srt:
+        base_cmd += ["--external-srt", str(Path(args.external_srt).expanduser().resolve())]
     tasks = ["transcribe", "translate", "dub"] if args.task == "full" else [args.task]
     commands = []
     for task in tasks:
