@@ -23,6 +23,7 @@ LANGS=[("Auto detect","auto"),("English","en"),("Arabic","ar"),("French","fr"),(
 TARGETS=[("Arabic","Arabic","ar"),("English","English","en"),("French","French","fr"),("Spanish","Spanish","es"),("German","German","de"),("Italian","Italian","it"),("Portuguese","Portuguese","pt"),("Japanese","Japanese","ja"),("Korean","Korean","ko"),("Chinese","Chinese","zh"),("Russian","Russian","ru"),("Hindi","Hindi","hi")]
 LLMS=[("Fanar-1-9B-Instruct","Fanar-1-9B-Instruct (Arabic/English — 8 GB+ VRAM)"),("Qwen3.5-9B","Qwen3.5-9B"),("Qwen2.5-7B-Instruct","Qwen2.5-7B-Instruct")]
 WHISPERS=["large-v3","medium","small","base","tiny"]
+MEDIA_EXT={".mp4",".mkv",".mov",".avi",".wmv",".webm",".m4v",".mpeg",".mpg",".ts",".m2ts",".3gp",".flv",".mp3",".wav",".m4a",".flac",".ogg",".aac",".opus"}
 
 
 def clear():
@@ -50,10 +51,31 @@ def defaults():
 
 
 def header():
-    print(CYAN+"╔"+"═"*68+"╗\n║"+GREEN+"                  DUBBING CONTROL CENTER                  "+RESET+CYAN+"║\n╚"+"═"*68+"╝"+RESET)
+    print(CYAN + "=" * 76 + RESET)
+    print(GREEN + "                         DUBBING CONTROL CENTER" + RESET)
+    print(CYAN + "=" * 76 + RESET)
 
 
 def pause(): input("\nPress Enter to continue...")
+
+
+def input_inventory(s):
+    """Return the files that the selected batch mode will ask the CLI to process."""
+    source=Path(s["input"]).expanduser()
+    if s["source_mode"]=="single":
+        return [source] if source.is_file() else []
+    if s["source_mode"]=="list":
+        if not source.is_file(): return []
+        files=[]
+        for raw in source.read_text(encoding="utf-8-sig").splitlines():
+            value=raw.strip().strip('"')
+            if not value or value.startswith("#") or "://" in value: continue
+            path=Path(value).expanduser()
+            files.append(path if path.is_absolute() else source.parent/path)
+        return files
+    if not source.is_dir(): return []
+    paths=source.rglob("*") if s["recursive"] else source.iterdir()
+    return sorted([path for path in paths if path.is_file() and path.suffix.lower() in MEDIA_EXT], key=lambda p:str(p).casefold())
 
 
 def classify_log_line(line, warning_traceback=False, collecting_failure=False):
@@ -77,6 +99,72 @@ def classify_log_line(line, warning_traceback=False, collecting_failure=False):
         "warning_traceback": False if ends_warning_traceback else in_warning_traceback,
         "collecting_failure": collecting_failure or "[stage failed]" in low,
     }
+
+
+def _progress_bar(done, total, width=24):
+    try:
+        total = max(1, int(total))
+        done = max(0, min(total, int(done)))
+    except (TypeError, ValueError):
+        done, total = 0, 1
+    filled = int(width * done / total)
+    return "#" * filled + "-" * (width - filled)
+
+
+def _stage_name(value):
+    text = str(value or "").lower()
+    for token, label in (("split", "Split"), ("transcrib", "Transcribe"), ("translat", "Translate"),
+                         ("separat", "Separate"), ("dub", "Dub"), ("assembl", "Assemble"), ("packag", "Package")):
+        if token in text:
+            return label
+    return str(value or "Starting")
+
+
+def render_dashboard(*, total_videos, completed_videos, failed_videos, current_video,
+                     current_path, inventory, stage, stage_percent, chunk,
+                     remaining_steps, activity, speed, elapsed, model_status,
+                     model_percent, model_error, warnings, errors, last, recent,
+                     batch_mode):
+    """Render a compact dashboard while preserving the existing ANSI-only TUI."""
+    clear(); header()
+    remaining = max(0, total_videos - completed_videos - failed_videos)
+    current_label = Path(str(current_path)).name or str(current_path)
+    stage_label = _stage_name(stage)
+    print(f"\n{WHITE}BATCH STATUS{RESET}  {GREEN}{completed_videos} done{RESET}  {RED}{failed_videos} failed{RESET}  {YELLOW}{remaining} remaining{RESET} / {total_videos} total")
+    print(f"{DIM}{'-' * 76}{RESET}")
+    print(f"{WHITE}CURRENT VIDEO{RESET}  {YELLOW}[{current_video}/{total_videos}]{RESET} {GREEN}{current_label[-78:]}{RESET}")
+    print(f"{DIM}{str(current_path)[-112:]}{RESET}")
+    print(f"\n{WHITE}PROGRESS{RESET}")
+    print(f"  Stage: {stage_label:<10} [{_progress_bar(stage_percent, 100, 28)}] {stage_percent:3d}%")
+    print(f"  Chunk: {chunk:<10} Remaining: {remaining_steps}")
+    print(f"  Action: {activity}")
+    print(f"  Speed: {speed}  Elapsed: {elapsed}")
+    print(f"{WHITE}MODEL{RESET}     {model_status}" + (f"  {model_percent}" if model_percent else ""))
+    if model_error:
+        print(RED + f"MODEL ERROR  {model_error[-150:]}" + RESET)
+
+    if batch_mode:
+        print(f"\n{WHITE}QUEUE{RESET}")
+        for index, path in enumerate(inventory[:10], 1):
+            normalized = str(path).casefold()
+            display_name = Path(path).name[-58:]
+            if index <= completed_videos:
+                marker, color, state = "DONE", GREEN, "DONE"
+            elif index == current_video or normalized == str(current_path).casefold():
+                marker, color, state = "RUN ", CYAN, "RUNNING"
+            elif index <= completed_videos + failed_videos:
+                marker, color, state = "FAIL", RED, "FAILED"
+            else:
+                marker, color, state = "WAIT", DIM, "WAITING"
+            print(f"  {color}{marker}{RESET} {index:02d} {display_name:<58} {color}{state}{RESET}")
+        if len(inventory) > 10:
+            print(f"  {DIM}... and {len(inventory) - 10} more video(s){RESET}")
+
+    print(f"\n{WHITE}RECENT LOG{RESET}")
+    for line in list(recent)[-7:]:
+        print(f"  {line[-118:]}")
+    print(f"\n{DIM}Warnings {len(warnings)}  |  Errors {len(errors)}  |  {last[-130:]}{RESET}")
+    print(f"{DIM}Keys: Ctrl+C stop safely  |  dashboard refreshes every second{RESET}")
 
 
 def show_help():
@@ -193,7 +281,8 @@ def edit(s, number):
     elif number==19: s["external_srt"]=prompt_text("External SRT path (used by SRT dubbing)",s.get("external_srt", ""))
     elif number==20: s["text_mode"]=["auto","normal","fitted"][choose("Text used for dubbing",["Auto: Normal, speed-up, then Fitted fallback","Normal only (default)","Fitted only"],["auto","normal","fitted"].index(s["text_mode"]))]
 def render_menu(s):
-    clear(); header(); print("\n"+WHITE+"Current settings"+RESET+"\n")
+    clear(); header()
+    print(f"\n{WHITE}SETTINGS{RESET}  {DIM}(enter a number to edit a setting){RESET}\n")
     rows = [
         ("Input / batch source", s["input"] or "<not selected>"),
         ("Source type", s["source_mode"]),
@@ -216,15 +305,28 @@ def render_menu(s):
         ("External SRT", s.get("external_srt") or "Not selected"),
         ("Dubbing text mode", s["text_mode"]),
     ]
-    for i,(label,value) in enumerate(rows,1): print(f"  {YELLOW}{i:2d}{RESET}. {label:<22} {GREEN}{value}{RESET}")
-    print(f"  {DIM}SRT output operations create translated and/or bilingual files in the final folder.{RESET}")
-    print(f"\n  {GREEN}S{RESET}. Start selected operation\n  {CYAN}H{RESET}. Show operations and outputs\n  {CYAN}P{RESET}. Save profile\n  {CYAN}L{RESET}. Load profile\n  {CYAN}D{RESET}. Delete profile\n  {RED}0{RESET}. Exit")
+    groups = (("INPUT", 0, 3), ("LANGUAGE AND MODELS", 3, 7), ("VOICE AND OUTPUT", 7, 11), ("PROCESSING", 11, 17), ("OPERATION", 17, 20))
+    for title, start, end in groups:
+        print(f"{CYAN}{title}{RESET}")
+        print(f"{DIM}{'-' * 76}{RESET}")
+        for i in range(start, end):
+            label, value = rows[i]
+            shown = str(value)
+            if len(shown) > 48:
+                shown = "..." + shown[-45:]
+            print(f"  {YELLOW}{i + 1:2d}{RESET}. {label:<22} {GREEN}{shown}{RESET}")
+        print()
+    print(f"{DIM}SRT operations create translated and/or bilingual files in the final folder.{RESET}")
+    print(f"\n{GREEN}S{RESET}. Start   {CYAN}H{RESET}. Help   {CYAN}P{RESET}. Save profile   {CYAN}L{RESET}. Load profile   {CYAN}D{RESET}. Delete profile   {RED}0{RESET}. Exit")
 
 
 def run(s):
     if not s["input"]:
         print(RED+"A local input, TXT list, or folder path is required."+RESET); pause(); return
     src=Path(s["input"]).expanduser()
+    inventory=input_inventory(s)
+    if not inventory:
+        print(RED+"No readable video/audio files were found in the selected input."+RESET); pause(); return
     workspace=src.parent/(src.stem+"_dubbing")
     log_path=workspace/"logs"/f"run_{time.strftime('%Y%m%d_%H%M%S')}.log"
     cmd=[sys.executable,str(BASE/"dub_cli.py")]
@@ -242,8 +344,29 @@ def run(s):
     destination_note=f"Workspace: {workspace}\nFinal output: {workspace/'final'}" if s["source_mode"]=="single" else "Batch mode: sequential; each input gets its own sibling <name>_dubbing\\final folder and run log."
     if s["source_mode"] != "single":
         destination_note += "\nBATCH ORDER: ONE VIDEO AT A TIME. Full finishes Transcribe -> Translate -> Dub for each video before the next starts."
-    clear(); header(); print("\nENVIRONMENT CHECK\n"+check_text+"\n\nCONFIRM JOB\n\nCommand:\n"+subprocess.list2cmdline(cmd)+f"\n\n{destination_note}")
-    if input("\nStart? [Y/n]: ").strip().lower() not in {"", "y", "yes"}: return
+    clear(); header()
+    print(f"\n{WHITE}CONFIRM JOB{RESET}  {DIM}(review before starting){RESET}\n")
+    print(f"{CYAN}INPUT INVENTORY{RESET}")
+    print(f"{DIM}{'-' * 76}{RESET}")
+    print(f"Files to process: {GREEN}{len(inventory)}{RESET}   Source type: {GREEN}{s['source_mode']}{RESET}   Recursive: {GREEN}{'Yes' if s['recursive'] else 'No'}{RESET}")
+    for index,path in enumerate(inventory[:8],1):
+        print(f"  {index:02d}. {str(path)[-102:]}")
+    if len(inventory)>8: print(f"  {DIM}... and {len(inventory)-8} more file(s){RESET}")
+    print(f"\n{CYAN}RUN SETTINGS{RESET}")
+    print(f"{DIM}{'-' * 76}{RESET}")
+    print(f"Operation: {GREEN}{s['task']}{RESET}   Output: {GREEN}{s['output']}{RESET}   Device: {GREEN}{s['device']}{RESET}")
+    print(f"Language: {GREEN}{s['source_language']} -> {s['target_language']} ({s['target_code']}){RESET}")
+    print(f"Models: Whisper={GREEN}{s['whisper']}{RESET}  Translation={GREEN}{s['llm'].split(' (')[0]}{RESET}")
+    print(f"Voice: {GREEN}{s['gender']}{RESET}  Reference: {GREEN}{Path(s['reference_audio']).name if s['reference_audio'] else 'Default voice'}{RESET}")
+    print(f"Workspace: {workspace}\n")
+    print(f"{CYAN}ENVIRONMENT CHECK{RESET}")
+    print(f"{DIM}{'-' * 76}{RESET}")
+    for line in check_text.splitlines()[-12:]:
+        print(f"  {line[-102:]}")
+    print(f"\n{CYAN}COMMAND{RESET}\n{DIM}{subprocess.list2cmdline(cmd)}{RESET}\n")
+    print(f"{CYAN}OUTPUT{RESET}\n{destination_note}")
+    print(f"\n{GREEN}Press Enter or type Y to start{RESET}   {YELLOW}N{RESET} Cancel")
+    if input("\nStart job? [Y/n]: ").strip().lower() not in {"", "y", "yes"}: return
     try:
         temporary = LAST_SESSION_FILE.with_suffix(".tmp")
         temporary.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -265,6 +388,10 @@ def run(s):
         finally: output.put(None)
     threading.Thread(target=reader,daemon=True).start()
     recent=deque(maxlen=16); warnings=deque(maxlen=100); errors=deque(maxlen=100); last="Starting..."; stage="Starting"; chunk="-"; done=False; next_render=0.0
+    total_videos=len(inventory); completed_videos=0; failed_videos=0; current_video=1; current_path=str(inventory[0])
+    batch_mode = s["source_mode"] in {"folder", "list"}
+    stage_percent=0; speed="unknown"; remaining_steps="starting"; model_status="No model activity yet"; model_percent=""; model_error=""; activity="Preparing input"
+    last_extract_at=None; extract_speed=""
     warning_traceback=False; collecting_failure=False
     try:
         while not done or proc.poll() is None:
@@ -281,6 +408,50 @@ def run(s):
                 if item is None:
                     done=True; changed=True; continue
                 changed=True; last=item; recent.append(item); low=item.lower()
+                progress_match=re.search(r"\[progress\]\s+videos_total=(\d+)\s+videos_completed=(\d+)\s+videos_failed=(\d+)\s+current_video=(\d+)\s+current_path=(.*?)\s+stage=(\S+)\s+stage_percent=(\d+)\s+speed=(.*?)\s+remaining=(.*?)(?:\s+error=(.*))?$", item, re.IGNORECASE)
+                if progress_match:
+                    progress_total=int(progress_match.group(1))
+                    # In folder/list mode the outer CLI owns the batch counters.
+                    # Each child video process emits videos_total=1; accepting that
+                    # value here makes the TUI incorrectly display 1/N as 1 total.
+                    if batch_mode and total_videos > 1 and progress_total == 1:
+                        current_path=progress_match.group(5); stage=progress_match.group(6); stage_percent=int(progress_match.group(7)); speed=progress_match.group(8)
+                        remaining_steps=progress_match.group(9); model_error=progress_match.group(10) or model_error
+                    else:
+                        total_videos=progress_total; completed_videos=int(progress_match.group(2)); failed_videos=int(progress_match.group(3)); current_video=int(progress_match.group(4)); current_path=progress_match.group(5); stage=progress_match.group(6); stage_percent=int(progress_match.group(7)); speed=progress_match.group(8); remaining_steps=progress_match.group(9); model_error=progress_match.group(10) or model_error
+                percent_match=re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", item)
+                speed_match=re.search(r"(\d+(?:\.\d+)?)\s*(it/s|steps?/s|[kmgt]?b/s|samples?/s)", item, re.IGNORECASE)
+                if percent_match and not progress_match: stage_percent=min(100, int(float(percent_match.group(1))))
+                if speed_match and not progress_match: speed=speed_match.group(1)+" "+speed_match.group(2)
+                segment_match=re.search(r"(\d+)\s*/\s*(\d+)\s+segments translated", low)
+                if segment_match and not progress_match:
+                    segment_done=int(segment_match.group(1)); segment_total=max(1, int(segment_match.group(2)))
+                    stage_percent=min(100, int(segment_done * 100 / segment_total))
+                    remaining_steps=f"{max(0, segment_total-segment_done)} segment(s) in current chunk"
+                if any(token in low for token in ("download", "downloading", "loading model", "load model", "model download")):
+                    model_status=item[-260:]
+                    if percent_match: model_percent=percent_match.group(1)+"%"
+                if any(token in low for token in ("model", "whisper", "torch", "cuda", "checkpoint")) and any(token in low for token in ("error", "failed", "exception", "not found", "missing")):
+                    model_error=item[-300:]
+                if "[resume]" in low: activity="Reusing checkpoints and jumping to the first incomplete chunk"
+                elif "reading" in low or "probe" in low or "duration" in low: activity="Reading file metadata and duration"
+                elif "quiet gap" in low or "silence" in low: activity="Analyzing silence and split points"
+                elif "extracting audio" in low: activity="Extracting audio chunk"
+                elif "loading llm" in low or "load_model" in low: activity="Loading translation model"
+                elif "transcrib" in low: activity="Transcribing speech"
+                elif "translat" in low: activity="Translating text"
+                elif "separat" in low: activity="Separating vocals and background"
+                elif "dubb" in low: activity="Generating dubbed speech"
+                elif "assembl" in low or "ffmpeg" in low: activity="Assembling final media"
+                extract_match=re.search(r"extracting audio.*?:\s*([0-9.]+)s\s*->\s*([0-9.]+)s", low)
+                if extract_match:
+                    wall_now=time.monotonic()
+                    if last_extract_at is not None:
+                        media_seconds=abs(float(extract_match.group(2))-float(extract_match.group(1)))
+                        wall_seconds=max(0.01, wall_now-last_extract_at)
+                        extract_speed=f"{media_seconds/wall_seconds:.1f}x media-time"
+                    last_extract_at=wall_now
+                    speed=extract_speed or "measuring..."
                 classification=classify_log_line(item,warning_traceback,collecting_failure)
                 warning_traceback=classification["warning_traceback"]
                 collecting_failure=classification["collecting_failure"]
@@ -289,12 +460,27 @@ def run(s):
                 for token,label in [("split","Split"),("transcrib","Transcription"),("translat","Translation"),("separat","Separation"),("dub","Dubbing"),("assembl","Assembly")]:
                     if token in low: stage=label
                 m=re.search(r"chunk[_ ]?(\d+)(?:\s*/\s*(\d+))?",low)
-                if m: chunk=(m.group(1)+("/"+m.group(2) if m.group(2) else ""))
+                if m:
+                    chunk=(m.group(1)+("/"+m.group(2) if m.group(2) else ""))
+                    if not progress_match and m.group(2):
+                        chunk_index=int(m.group(1)); chunk_total=max(1, int(m.group(2)))
+                        stage_percent=min(100, int(chunk_index * 100 / chunk_total))
+                        remaining_steps=f"{max(0, chunk_total-chunk_index)} chunk(s)"
             now=time.monotonic()
             if now>=next_render or (done and proc.poll() is not None):
-                clear(); header(); print(f"\nCurrent stage: {stage}\nCurrent chunk: {chunk}\nElapsed: {timedelta(seconds=int(now-start))}\nWarnings: {len(warnings)}"+(f" | {warnings[-1][-180:]}" if warnings else "")+f"\nErrors: {len(errors)}"+(f" | {errors[-1][-180:]}" if errors else "")+f"\nLast message: {last[-250:]}\n\nRecent log:")
-                for line in recent: print(line[-240:])
-                print(DIM+f"\nFull log: {log_path}"+RESET)
+                render_dashboard(
+                    total_videos=total_videos, completed_videos=completed_videos,
+                    failed_videos=failed_videos, current_video=current_video,
+                    current_path=current_path, inventory=inventory, stage=stage,
+                    stage_percent=stage_percent, chunk=chunk,
+                    remaining_steps=remaining_steps, activity=activity,
+                    speed=speed, elapsed=timedelta(seconds=int(now-start)),
+                    model_status=model_status, model_percent=model_percent,
+                    model_error=model_error, warnings=warnings, errors=errors,
+                    last=last, recent=recent, batch_mode=batch_mode,
+                )
+                log_display = str(log_path) if s["source_mode"] == "single" else "Each video has its own log under <video>_dubbing\\logs"
+                print(DIM+f"Full log: {log_display}"+RESET)
                 next_render=now+1.0
         code=proc.wait()
     except KeyboardInterrupt:
