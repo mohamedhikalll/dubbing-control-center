@@ -2,15 +2,15 @@ import os
 import torch
 
 # Nom du projet
-APP_NAME = "ZastTranslate"
+APP_NAME = "Dubbing Control Center"
 APP_VERSION = "1.20"
 
 # Chemins
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_USER_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "zasttranslate")
-_JOB_ROOT = os.environ.get("ZAST_WORK_DIR")
-TEMP_DIR = os.environ.get("ZAST_TEMP_DIR", os.path.join(_JOB_ROOT, "temp") if _JOB_ROOT else os.path.join(_USER_CACHE, "temp"))
-OUTPUT_DIR = os.environ.get("ZAST_OUTPUT_DIR", os.path.join(_JOB_ROOT, "final") if _JOB_ROOT else os.path.join(_USER_CACHE, "output"))
+_USER_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "dubbing-control-center")
+_JOB_ROOT = os.environ.get("DUBBING_WORK_DIR")
+TEMP_DIR = os.environ.get("DUBBING_TEMP_DIR", os.path.join(_JOB_ROOT, "temp") if _JOB_ROOT else os.path.join(_USER_CACHE, "temp"))
+OUTPUT_DIR = os.environ.get("DUBBING_OUTPUT_DIR", os.path.join(_JOB_ROOT, "final") if _JOB_ROOT else os.path.join(_USER_CACHE, "output"))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 VOICES_DIR = os.path.join(BASE_DIR, "voices")
 
@@ -19,7 +19,7 @@ for d in [TEMP_DIR, OUTPUT_DIR, MODELS_DIR, VOICES_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # GPU/CPU
-_REQUESTED_DEVICE = os.environ.get("ZAST_DEVICE", "").strip().lower()
+_REQUESTED_DEVICE = os.environ.get("DUBBING_DEVICE", "").strip().lower()
 DEVICE = _REQUESTED_DEVICE if _REQUESTED_DEVICE in {"cuda", "cpu"} else ("cuda" if torch.cuda.is_available() else "cpu")
 try:
     GPU_NAME = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None"

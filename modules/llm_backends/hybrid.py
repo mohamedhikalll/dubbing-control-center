@@ -40,12 +40,12 @@ class AcceleratedLLMBackend(LLMBackend):
             return
 
         # Check if local GGUF already exists
-        gguf_dir = os.path.expanduser("~/.zasttranslate/models/gguf")
+        gguf_dir = os.path.expanduser("~/.dubbing-control-center/models/gguf")
         gguf_local_path = os.path.join(gguf_dir, self.gguf_file) if self.gguf_file else None
         has_local_gguf = gguf_local_path and os.path.exists(gguf_local_path)
 
         # Check if local PyTorch model already exists
-        hf_dir = os.path.expanduser("~/.zasttranslate/models/hub")
+        hf_dir = os.path.expanduser("~/.dubbing-control-center/models/hub")
         pt_folder = f"models--{self.model_id.replace('/', '--')}"
         has_local_pt = os.path.exists(os.path.join(hf_dir, pt_folder))
 

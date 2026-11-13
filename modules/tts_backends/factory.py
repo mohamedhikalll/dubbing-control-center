@@ -1,10 +1,23 @@
 import os
-from .voxcpm2 import VoxCPM2Backend
 
-# Redirect HuggingFace cache to shared directory
-HF_HOME = os.path.expanduser("~/.zasttranslate/models")
-os.makedirs(HF_HOME, exist_ok=True)
+# Configure the shared Hugging Face cache before importing VoxCPM2.  The old
+# order imported the backend first, allowing huggingface_hub to keep using the
+# default C:\Users\<user>\.cache\huggingface location for the TTS model.
+HF_HOME = os.path.expanduser("~/.dubbing-control-center/models")
+HF_HUB_CACHE = os.path.join(HF_HOME, "hub")
+os.makedirs(HF_HUB_CACHE, exist_ok=True)
 os.environ["HF_HOME"] = HF_HOME
+os.environ["HF_HUB_CACHE"] = HF_HUB_CACHE
+os.environ["HUGGINGFACE_HUB_CACHE"] = HF_HUB_CACHE
+
+try:
+    import huggingface_hub.constants as _hf_constants
+    _hf_constants.HF_HOME = HF_HOME
+    _hf_constants.HF_HUB_CACHE = HF_HUB_CACHE
+except (ImportError, AttributeError):
+    pass
+
+from .voxcpm2 import VoxCPM2Backend
 
 class TTSFactory:
     def __init__(self):

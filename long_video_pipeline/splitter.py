@@ -327,6 +327,25 @@ def split_video(
         duration = probe_duration(input_path)
         job.log(f"[SPLIT] Source duration: {duration:.3f}s")
 
+        manifest_path = job.status_dir / "chunks_manifest.json"
+        cached_boundaries = None
+        cached_silences: list[tuple[float, float]] = []
+        try:
+            cached = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if (
+                cached.get("source") == str(input_path)
+                and abs(float(cached.get("duration", -1.0)) - duration) < 0.5
+                and abs(float(cached.get("chunk_minutes", -1.0)) - float(chunk_minutes)) < 0.001
+                and abs(float(cached.get("search_window", -1.0)) - float(search_window)) < 0.001
+                and isinstance(cached.get("boundaries"), list)
+                and len(cached["boundaries"]) >= 2
+            ):
+                cached_boundaries = [float(value) for value in cached["boundaries"]]
+                cached_silences = [tuple(item) for item in cached.get("silences", []) if isinstance(item, (list, tuple)) and len(item) == 2]
+                job.log(f"[RESUME] Reusing saved split boundaries ({len(cached_boundaries)-1} chunk(s)); skipping silence scan.")
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            cached_boundaries = None
+
         job.log(f"[SPLIT] Searching for quiet gaps only within ±{search_window:.1f}s of each target.")
         scanned_silences: list[tuple[float, float]] = []
 
@@ -342,16 +361,28 @@ def split_video(
             job.log(f"[SPLIT] Quiet-gap search {start:.1f}-{end:.1f}s: {len(found)} interval(s).")
             return found
 
-        boundaries = calculate_boundaries(
+        boundaries = cached_boundaries or calculate_boundaries(
             duration,
             [],
             chunk_minutes=chunk_minutes,
             search_window=search_window,
             silence_search=search_local_silences,
         )
-        silences = sorted(set(scanned_silences))
+        silences = sorted(set(cached_silences or scanned_silences))
         if not silences:
             job.log("[WARN] No quiet gaps were found near chunk targets; target times will be used and may intersect speech.")
+
+        # Persist boundaries before extracting any chunk so an interrupted run can resume
+        # without scanning all silence windows again.
+        atomic_write_text(
+            manifest_path,
+            json.dumps({
+                "source": str(input_path), "duration": duration,
+                "chunk_minutes": chunk_minutes, "search_window": search_window,
+                "silences": silences, "boundaries": boundaries,
+                "chunks": [], "status": "boundaries_ready",
+            }, ensure_ascii=False, indent=2),
+        )
 
         chunks: list[ChunkInfo] = []
 
@@ -402,7 +433,6 @@ def split_video(
                 chunk_path=str(output_path.resolve()),
             )
 
-        manifest_path = job.status_dir / "chunks_manifest.json"
         atomic_write_text(
             manifest_path,
             json.dumps(

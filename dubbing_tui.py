@@ -114,7 +114,7 @@ def _progress_bar(done, total, width=24):
 def _stage_name(value):
     text = str(value or "").lower()
     for token, label in (("split", "Split"), ("transcrib", "Transcribe"), ("translat", "Translate"),
-                         ("separat", "Separate"), ("dub", "Dub"), ("assembl", "Assemble"), ("packag", "Package")):
+                         ("separat", "Separate"), ("dub", "Dubbing"), ("assembl", "Assemble"), ("packag", "Package")):
         if token in text:
             return label
     return str(value or "Starting")
@@ -419,6 +419,14 @@ def run(s):
                         remaining_steps=progress_match.group(9); model_error=progress_match.group(10) or model_error
                     else:
                         total_videos=progress_total; completed_videos=int(progress_match.group(2)); failed_videos=int(progress_match.group(3)); current_video=int(progress_match.group(4)); current_path=progress_match.group(5); stage=progress_match.group(6); stage_percent=int(progress_match.group(7)); speed=progress_match.group(8); remaining_steps=progress_match.group(9); model_error=progress_match.group(10) or model_error
+                dub_progress=re.search(r"\[dub progress\]\s+chunk=(\d+)\s*/\s*(\d+).*?stage_percent=(\d+).*?remaining=(\d+).*?status=(\S+)", low)
+                if dub_progress:
+                    dub_done=int(dub_progress.group(1)); dub_total=max(1, int(dub_progress.group(2)))
+                    stage="Dubbing"
+                    stage_percent=int(dub_progress.group(3))
+                    chunk=f"DUB {dub_done:03d}/{dub_total:03d}"
+                    remaining_steps=f"{dub_progress.group(4)} dubbing chunk(s)"
+                    activity="Generating dubbed speech"
                 percent_match=re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", item)
                 speed_match=re.search(r"(\d+(?:\.\d+)?)\s*(it/s|steps?/s|[kmgt]?b/s|samples?/s)", item, re.IGNORECASE)
                 if percent_match and not progress_match: stage_percent=min(100, int(float(percent_match.group(1))))
@@ -431,7 +439,7 @@ def run(s):
                 if any(token in low for token in ("download", "downloading", "loading model", "load model", "model download")):
                     model_status=item[-260:]
                     if percent_match: model_percent=percent_match.group(1)+"%"
-                if any(token in low for token in ("model", "whisper", "torch", "cuda", "checkpoint")) and any(token in low for token in ("error", "failed", "exception", "not found", "missing")):
+                if ("model error" in low or "model failed" in low or "[stage failed]" in low) and any(token in low for token in ("model", "whisper", "torch", "cuda", "voxcpm", "safetensors")):
                     model_error=item[-300:]
                 if "[resume]" in low: activity="Reusing checkpoints and jumping to the first incomplete chunk"
                 elif "reading" in low or "probe" in low or "duration" in low: activity="Reading file metadata and duration"
@@ -457,10 +465,11 @@ def run(s):
                 collecting_failure=classification["collecting_failure"]
                 if classification["warning"]: warnings.append(item)
                 if classification["error"]: errors.append(item)
-                for token,label in [("split","Split"),("transcrib","Transcription"),("translat","Translation"),("separat","Separation"),("dub","Dubbing"),("assembl","Assembly")]:
-                    if token in low: stage=label
+                if not progress_match and not dub_progress and not low.startswith("[resume]"):
+                    for token,label in [("[stage start] split","Split"),("[stage start] transcrib","Transcription"),("[stage start] translat","Translation"),("[stage start] separat","Separation"),("[stage start] dub","Dubbing"),("[stage start] assembl","Assembly")]:
+                        if token in low: stage=label
                 m=re.search(r"chunk[_ ]?(\d+)(?:\s*/\s*(\d+))?",low)
-                if m:
+                if m and not dub_progress:
                     chunk=(m.group(1)+("/"+m.group(2) if m.group(2) else ""))
                     if not progress_match and m.group(2):
                         chunk_index=int(m.group(1)); chunk_total=max(1, int(m.group(2)))

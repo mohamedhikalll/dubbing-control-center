@@ -71,7 +71,7 @@ def fix_inter_cue_casing(cues: List[Dict[str, Any]], text_key: str = "text", lan
     norm_lang = (lang_code or "fr").lower()[:2]
         
     glossary = {
-        "ZastTranslate", "YouTube", "VoxCPM", "Qwen", "FLUX", "FLUX.1", "Pinokio",
+        "Dubbing Control Center", "YouTube", "VoxCPM", "Qwen", "FLUX", "FLUX.1", "Pinokio",
         "Whisper", "WhisperX", "Claude", "OpenAI", "ChatGPT", "WordPress", "TikTok",
         "Midjourney", "ComfyUI", "Gradio", "SEO", "IA", "AI", "URL", "API", "TTS", "LLM",
         "SRT", "VTT", "SBV", "CPS", "HD", "4K", "TF32", "NVIDIA", "CUDA", "JSON",
@@ -125,7 +125,7 @@ def fix_inter_cue_casing(cues: List[Dict[str, Any]], text_key: str = "text", lan
                         continue
                 # 4. Acronym: len >= 2 and all uppercase (e.g. SEO, IA, AI, URL)
                 is_acronym = (len(first_tok) >= 2 and first_tok.isupper())
-                # 5. Mixed case: has uppercase inside (e.g. YouTube, VoxCPM, ZastTranslate)
+                # 5. Mixed case: has uppercase inside (e.g. YouTube, VoxCPM, Dubbing Control Center)
                 is_mixed_case = any(c.isupper() for c in first_tok[1:])
                 # 6. In glossary set
                 clean_tok = re.sub(r'[^\w]', '', first_tok)

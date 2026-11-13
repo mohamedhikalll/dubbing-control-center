@@ -55,6 +55,7 @@ def get_backend_catalog(language: str | None = None):
     return None
 
 BASE = Path(__file__).resolve().parent
+from long_video_pipeline.job_manager import inspect_job_artifacts
 PROFILE_FILE = BASE / "profiles.json"
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".opus"}
 VIDEO_EXT = {".mp4", ".mkv", ".mov", ".avi", ".wmv", ".webm", ".m4v", ".mpeg", ".mpg", ".ts", ".m2ts", ".3gp", ".flv"}
@@ -81,6 +82,88 @@ def _save_profile(name: str, values: dict) -> None:
 
 def _workspace(source: Path) -> Path:
     return source.parent / f"{source.stem}_dubbing"
+
+
+def _resume_summary(source: Path, task: str) -> dict:
+    """Read a compact per-video checkpoint summary without loading any model."""
+    state_path = _workspace(source) / "status" / "job_state.json"
+    summary = {"exists": False, "status": "new", "last_task": None, "chunks_total": 0, "chunks_done": 0, "stages": [], "stage_counts": {}, "partial_files": []}
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        chunks = state.get("chunks", {}) if isinstance(state, dict) else {}
+        stages = state.get("stages", {}) if isinstance(state, dict) else {}
+        summary.update({
+            "exists": True,
+            "status": state.get("status", "unknown"),
+            "last_task": state.get("last_task"),
+            "chunks_total": len(chunks),
+            "stages": [name for name, item in stages.items() if isinstance(item, dict) and item.get("status") == "completed"],
+        })
+        if task in {"split"}:
+            key = "status"
+        elif task in {"transcribe"}:
+            key = "transcription_status"
+        elif task in {"translate", "translate_srt", "bilingual_srt"}:
+            key = "translation_status"
+        else:
+            key = "dubbing_status"
+        summary["chunks_done"] = sum(1 for item in chunks.values() if isinstance(item, dict) and item.get(key) in {"completed", "split_completed"})
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        pass
+    artifact = inspect_job_artifacts(_workspace(source))
+    if artifact.get("exists"):
+        summary["exists"] = True
+        summary["status"] = artifact.get("status", summary["status"])
+        summary["last_task"] = artifact.get("last_task") or summary["last_task"]
+        summary["chunks_total"] = max(summary["chunks_total"], int(artifact.get("total_chunks", 0)))
+        stage_data = artifact.get("stages", {})
+        stage_name = {"split":"split", "transcribe":"transcribe", "translate":"translate", "translate_srt":"translate", "bilingual_srt":"translate"}.get(task, "dub")
+        selected = stage_data.get(stage_name, {})
+        if selected.get("total", 0) and selected.get("done", 0) > summary["chunks_done"]:
+            summary["chunks_done"] = selected["done"]
+        for name, item in stage_data.items():
+            summary["stage_counts"][name] = {"done": int(item.get("done", 0)), "total": int(item.get("total", 0)), "state": item.get("state", "pending")}
+            if item.get("total", 0) and item.get("done", 0) == item.get("total", 0) and name not in summary["stages"]:
+                summary["stages"].append(name)
+        summary["partial_files"] = artifact.get("partials", [])
+        if task == "full":
+            summary["chunks_done"] = max((item.get("done", 0) for item in stage_data.values()), default=summary["chunks_done"])
+    return summary
+
+
+def _operation_complete(source: Path, task: str) -> bool:
+    summary = _resume_summary(source, task)
+    if not summary["exists"]:
+        return False
+    if task == "full":
+        return summary["status"] == "completed"
+    if task == "split":
+        return "split" in summary["stages"] and summary["chunks_total"] > 0 and summary["chunks_done"] == summary["chunks_total"]
+    if task == "transcribe":
+        output = _workspace(source) / "final" / f"{source.stem}_source.srt"
+        return "transcribe" in summary["stages"] and summary["chunks_total"] > 0 and summary["chunks_done"] == summary["chunks_total"] and output.is_file() and output.stat().st_size > 0
+    if task in {"translate", "translate_srt", "bilingual_srt"}:
+        suffix = "_bilingual_en_ar.srt" if task == "bilingual_srt" else "_arabic.srt"
+        output = _workspace(source) / "final" / f"{source.stem}{suffix}"
+        return "translate" in summary["stages"] and summary["chunks_total"] > 0 and summary["chunks_done"] == summary["chunks_total"] and output.is_file() and output.stat().st_size > 0
+    if task in {"dub", "srt_dub"}:
+        return summary["status"] == "completed"
+    return False
+
+
+def _print_resume_summary(source: Path, task: str) -> None:
+    summary = _resume_summary(source, task)
+    if not summary["exists"]:
+        print(f"[RESUME] No checkpoint found for {source.name}; starting a new video.", flush=True)
+        return
+    stages = ", ".join(summary["stages"]) or "none"
+    stage_details = ", ".join(f"{name}={item['done']}/{item['total']}" for name, item in summary.get("stage_counts", {}).items() if item.get("total")) or "none"
+    print(
+        f"[RESUME] Video checkpoint: status={summary['status']} last_task={summary['last_task'] or 'none'} "
+        f"chunks={summary['chunks_done']}/{summary['chunks_total']} completed "
+        f"stages={stages}; progress={stage_details}; resuming only missing work.",
+        flush=True,
+    )
 
 
 def _batch_destination(output_dir: str | os.PathLike, source: str | os.PathLike) -> Path:
@@ -518,7 +601,15 @@ def _run(args: argparse.Namespace) -> int:
         failed: list[tuple[str, str]] = []
         stopped = False
         for index, source in enumerate(sources, 1):
+            source_path = Path(source).expanduser().resolve()
+            if _operation_complete(source_path, args.task):
+                succeeded.append(source)
+                print(f"\n[BATCH SKIP {index}/{len(sources)}] {source} — operation '{args.task}' already completed; no work to do.")
+                print(f"[PROGRESS] videos_total={len(sources)} videos_completed={len(succeeded)} videos_failed={len(failed)} current_video={index} current_path={source} stage=already_completed stage_percent=100 speed=skipped remaining={len(sources) - len(succeeded) - len(failed)}", flush=True)
+                continue
             print(f"\n[BATCH START {index}/{len(sources)}] {source}")
+            _print_resume_summary(source_path, args.task)
+            print(f"[PROGRESS] videos_total={len(sources)} videos_completed={len(succeeded)} videos_failed={len(failed)} current_video={index} current_path={source} stage=starting stage_percent=0 speed=unknown remaining=starting", flush=True)
             child = argparse.Namespace(**vars(args))
             child.input = source
             child.batch_list = None
@@ -544,9 +635,11 @@ def _run(args: argparse.Namespace) -> int:
             if code == 0:
                 succeeded.append(source)
                 print(f"[BATCH ITEM DONE] {source}")
+                print(f"[PROGRESS] videos_total={len(sources)} videos_completed={len(succeeded)} videos_failed={len(failed)} current_video={index} current_path={source} stage=completed stage_percent=100 speed=done remaining={len(sources) - len(succeeded) - len(failed)}", flush=True)
             else:
                 failed.append((source, "stopped by user; checkpoint kept" if code == 130 else reason))
                 print(f"[BATCH ITEM FAILED] {source} ({reason})")
+                print(f"[PROGRESS] videos_total={len(sources)} videos_completed={len(succeeded)} videos_failed={len(failed)} current_video={index} current_path={source} stage=failed stage_percent=0 speed=stopped remaining={len(sources) - len(succeeded) - len(failed)} error={reason}", flush=True)
                 if code == 130:
                     stopped = True
                     break
@@ -582,6 +675,10 @@ def _run(args: argparse.Namespace) -> int:
         raise SystemExit("ERROR: --redub can only be used with --task full or --task dub.")
     if not 1.0 <= args.max_speed <= 2.5:
         raise SystemExit("ERROR: --max-speed must be between 1.0 and 2.5.")
+    _print_resume_summary(source, args.task)
+    if _operation_complete(source, args.task) and not args.redub:
+        print(f"[RESUME] Operation '{args.task}' is already complete for {source.name}; skipping all processing.", flush=True)
+        return 0
 
     values = {k: v for k, v in vars(args).items() if k not in {"input", "open_tui", "profile", "save_profile", "list_profiles", "check", "dry_run", "resume", "redub", "log_file", "output_dir", "explicit_options"}}
     if args.save_profile:
@@ -621,8 +718,8 @@ def _run(args: argparse.Namespace) -> int:
 
     workspace.mkdir(parents=True, exist_ok=True)
     locks = _runtime_lock(workspace)
-    os.environ["ZAST_WORK_DIR"] = str(workspace)
-    os.environ["ZAST_TEMP_DIR"] = str(workspace / "temp")
+    os.environ["DUBBING_WORK_DIR"] = str(workspace)
+    os.environ["DUBBING_TEMP_DIR"] = str(workspace / "temp")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     worker_state = {"process": None}
@@ -651,7 +748,10 @@ def _run(args: argparse.Namespace) -> int:
             log.write(f"WORKSPACE: {workspace}\n")
             log.flush()
             code = 0
-            for phase, cmd in zip(tasks, commands):
+            total_phases = len(tasks)
+            for phase_index, (phase, cmd) in enumerate(zip(tasks, commands), 1):
+                stage_percent = int((phase_index - 1) * 100 / total_phases) if total_phases else 0
+                print(f"[PROGRESS] videos_total=1 videos_completed=0 videos_failed=0 current_video=1 current_path={source} stage={phase} stage_percent={stage_percent} speed=starting remaining={total_phases - phase_index + 1}", flush=True)
                 print(f"\n[PROCESS START] {phase.title()} (separate Python process)")
                 child_env = os.environ.copy()
                 child_env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
@@ -690,6 +790,9 @@ def _run(args: argparse.Namespace) -> int:
                     code = 130
                 log.flush()
                 print(f"[PROCESS EXIT] {phase.title()} code={code}")
+                final_percent = int(phase_index * 100 / total_phases) if total_phases else 100
+                result_stage = phase if code == 0 else "failed"
+                print(f"[PROGRESS] videos_total=1 videos_completed={1 if code == 0 and phase_index == total_phases else 0} videos_failed={1 if code else 0} current_video=1 current_path={source} stage={result_stage} stage_percent={final_percent if code == 0 else stage_percent} speed=done remaining={total_phases - phase_index}", flush=True)
                 if code:
                     break
         elapsed = str(timedelta(seconds=int(time.perf_counter() - started)))

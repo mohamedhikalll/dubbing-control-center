@@ -499,6 +499,18 @@ def _separate_chunk(
     background_valid = is_valid_audio_chunk(background_target, chunk.duration, tolerance=tolerance)
     if vocals_valid and background_valid:
         return vocals_target, background_target
+    if vocals_valid and not background_valid:
+        # The separator already treats vocals as the safe fallback when no
+        # background track is produced. Rebuild only the missing side instead
+        # of running the expensive separation again after an interruption.
+        if background_target.exists():
+            background_target.unlink()
+        shutil.copy2(vocals_target, background_target)
+        if not is_valid_audio_chunk(background_target, chunk.duration, tolerance=tolerance):
+            background_target.unlink(missing_ok=True)
+            raise RuntimeError(f"Could not rebuild background checkpoint from {vocals_target.name}")
+        job.log(f"[RESUME] Rebuilt missing {background_target.name} from validated vocals checkpoint")
+        return vocals_target, background_target
 
     for candidate, valid in ((vocals_target, vocals_valid), (background_target, background_valid)):
         if candidate.exists() and not valid:
@@ -551,7 +563,7 @@ def run_dubbing_stage(
     max_speed: float = 2.5,
 ) -> list[dict[str, Any]]:
     """
-    Automated dubbing wrapper using the original ZastTranslate path:
+    Automated dubbing wrapper using the original Dubbing Control Center path:
 
         TimeSync.sync_all()
         TimeSync.build_full_audio()
@@ -569,7 +581,7 @@ def run_dubbing_stage(
         raise RuntimeError("No chunks found in manifest.")
 
     if tts_device:
-        os.environ["ZAST_TTS_DEVICE"] = tts_device
+        os.environ["DUBBING_TTS_DEVICE"] = tts_device
     if text_mode not in {"auto", "normal", "fitted"}:
         raise ValueError("text_mode must be auto, normal, or fitted")
     if not 1.0 <= max_speed <= 2.5:
@@ -604,8 +616,46 @@ def run_dubbing_stage(
         job.start_stage("dub")
 
         tts_loaded = False
+        total_chunks = len(manifest)
+        desired_dubbing_settings = {
+            "text_mode": text_mode,
+            "language": language,
+            "gender": gender,
+            "reference_audio": str(Path(reference_audio).resolve()) if reference_audio else None,
+            "device": tts_device,
+            "max_speed": max_speed,
+        }
 
         for chunk in manifest:
+            print(
+                f"[DUB PROGRESS] chunk={chunk.number}/{total_chunks} "
+                f"stage=dub stage_percent={int((chunk.number - 1) * 100 / max(1, total_chunks))} "
+                f"remaining={max(0, total_chunks - chunk.number + 1)} status=starting",
+                flush=True,
+            )
+            duration = float(chunk.duration)
+            chunk_dir = job.dubbing_dir / f"chunk_{chunk.number:03d}"
+            voice_path = chunk_dir / "dubbed_voice.wav"
+            mixed_path = chunk_dir / "dubbed_mixed.wav"
+            state = job.get_chunk_state(chunk.number)
+            manifest_path = job.status_dir / f"chunk_{chunk.number:03d}_segment_manifest.json"
+            if (
+                state.get("dubbing_status") == "completed"
+                and is_valid_audio_chunk(voice_path, duration)
+                and is_valid_audio_chunk(mixed_path, duration)
+                and _valid_dubbing_manifest(manifest_path, chunk.number)
+                and state.get("dubbing_settings") == desired_dubbing_settings
+            ):
+                print(f"[RESUME] Skipping completed dubbing chunk {chunk.number:03d}")
+                print(
+                    f"[DUB PROGRESS] chunk={chunk.number}/{total_chunks} stage=dub "
+                    f"stage_percent={int(chunk.number * 100 / max(1, total_chunks))} "
+                    f"remaining={max(0, total_chunks - chunk.number)} status=completed",
+                    flush=True,
+                )
+                results.append({"chunk_number": chunk.number, "mixed_audio": str(mixed_path.resolve())})
+                continue
+
             translation_json = job.path_for_chunk(
                 job.translation_dir,
                 chunk.number,
@@ -654,15 +704,6 @@ def run_dubbing_stage(
 
             state = job.get_chunk_state(chunk.number)
             manifest_path = job.status_dir / f"chunk_{chunk.number:03d}_segment_manifest.json"
-            desired_dubbing_settings = {
-                "text_mode": text_mode,
-                "language": language,
-                "gender": gender,
-                "reference_audio": str(Path(reference_audio).resolve()) if reference_audio else None,
-                "device": tts_device,
-                "max_speed": max_speed,
-            }
-
             if (
                 state.get("dubbing_status") == "completed"
                 and is_valid_audio_chunk(voice_path, duration)
@@ -671,6 +712,12 @@ def run_dubbing_stage(
                 and state.get("dubbing_settings") == desired_dubbing_settings
             ):
                 print(f"[DUB] Reusing chunk {chunk.number:03d}")
+                print(
+                    f"[DUB PROGRESS] chunk={chunk.number}/{total_chunks} stage=dub "
+                    f"stage_percent={int(chunk.number * 100 / max(1, total_chunks))} "
+                    f"remaining={max(0, total_chunks - chunk.number)} status=completed",
+                    flush=True,
+                )
                 results.append(
                     {
                         "chunk_number": chunk.number,
@@ -708,6 +755,11 @@ def run_dubbing_stage(
                 prepared, _ = syncer.pre_check_and_shorten(
                     segments,
                     language,
+                )
+                print(
+                    f"[DUB] Generating speech for chunk {chunk.number:03d}/{total_chunks} "
+                    f"({len(prepared)} segments)",
+                    flush=True,
                 )
 
                 synced, sync_stats = syncer.sync_all(
@@ -817,6 +869,12 @@ def run_dubbing_stage(
 
                 job.log(
                     f"[DUB] Completed chunk {chunk.number:03d}"
+                )
+                print(
+                    f"[DUB PROGRESS] chunk={chunk.number}/{total_chunks} stage=dub "
+                    f"stage_percent={int(chunk.number * 100 / max(1, total_chunks))} "
+                    f"remaining={max(0, total_chunks - chunk.number)} status=completed",
+                    flush=True,
                 )
 
                 gc.collect()

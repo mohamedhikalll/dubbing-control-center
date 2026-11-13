@@ -85,7 +85,7 @@ def get_backend(name: str):
     _active_llm_backend = requested_backend
     
     # Redirect HuggingFace Cache to user's local directory to avoid C: drive bloat
-    models_dir = os.path.expanduser("~/.zasttranslate/models")
+    models_dir = os.path.expanduser("~/.dubbing-control-center/models")
     os.environ["HF_HOME"] = models_dir
     os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(models_dir, "hub")
     
