@@ -305,6 +305,31 @@ class JobContext:
         )
         self.log(f"[JOB FAILED] {error}")
 
+    def reconcile_interrupted(self) -> dict[str, Any]:
+        """Convert stale running states to interrupted before a safe resume."""
+        state = self.load_state()
+        changed = False
+        for stage_state in state.get("stages", {}).values():
+            if isinstance(stage_state, dict) and stage_state.get("status") == "running":
+                stage_state["status"] = "interrupted"
+                stage_state["interrupted_at"] = self._now()
+                changed = True
+        for chunk_state in state.get("chunks", {}).values():
+            if not isinstance(chunk_state, dict):
+                continue
+            if chunk_state.get("status") in {"transcribing", "translating", "separating", "dubbing", "assembling"}:
+                chunk_state["status"] = "interrupted"
+                chunk_state["interrupted_at"] = self._now()
+                for key, value in list(chunk_state.items()):
+                    if key.endswith("_status") and value == "running":
+                        chunk_state[key] = "interrupted"
+                changed = True
+        if changed:
+            state["status"] = "partial"
+            self.save_state(state)
+            self.log("[RESUME] Repaired stale running state after previous interruption")
+        return state
+
     def _validate_stage(self, stage: str) -> None:
         if stage not in self.STAGES:
             raise ValueError(
@@ -374,6 +399,55 @@ def create_job(output_dir: str | os.PathLike) -> JobContext:
     إنشاء Job جديد داخل output_dir.
     """
     return JobContext(output_dir)
+
+
+def inspect_job_artifacts(job_root: str | os.PathLike) -> dict[str, Any]:
+    """Inspect durable files without loading any ASR, translation, or TTS model."""
+    root = Path(job_root).expanduser().resolve()
+    status_dir = root / "status"
+    state_path = status_dir / "job_state.json"
+    result: dict[str, Any] = {
+        "root": str(root), "exists": state_path.is_file(), "status": "new",
+        "current_stage": None, "last_task": None, "total_chunks": 0,
+        "stages": {}, "partials": [], "repairable": False,
+    }
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return result
+    result.update({"status": state.get("status", "unknown"), "current_stage": state.get("current_stage"), "last_task": state.get("last_task")})
+    chunks: list[dict[str, Any]] = []
+    try:
+        manifest = json.loads((status_dir / "chunks_manifest.json").read_text(encoding="utf-8"))
+        chunks = manifest.get("chunks", []) if isinstance(manifest, dict) else []
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        pass
+    if not chunks:
+        chunks = list((state.get("chunks") or {}).values())
+    result["total_chunks"] = len(chunks)
+    stage_specs = {
+        "split": lambda n: (root / "chunks" / f"chunk_{n:03d}.m4a").is_file(),
+        "transcribe": lambda n: (root / "transcription" / f"chunk_{n:03d}.json").is_file() and (root / "transcription" / f"chunk_{n:03d}.srt").is_file(),
+        "translate": lambda n: all((root / "translation" / name).is_file() for name in (f"chunk_{n:03d}.json", f"chunk_{n:03d}_normal.srt", f"chunk_{n:03d}_fitted.srt")),
+        "separate": lambda n: all((root / "separated" / name).is_file() for name in (f"chunk_{n:03d}_vocals.wav", f"chunk_{n:03d}_background.wav")),
+        "dub": lambda n: all((root / "dubbing" / f"chunk_{n:03d}" / name).is_file() for name in ("dubbed_voice.wav", "dubbed_mixed.wav")),
+    }
+    for stage, checker in stage_specs.items():
+        done = 0
+        for item in chunks:
+            try:
+                number = int(item.get("number", item.get("chunk_number")))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            try:
+                done += int(bool(checker(number)))
+            except OSError:
+                pass
+        state_stage = (state.get("stages") or {}).get(stage, {})
+        result["stages"][stage] = {"done": done, "total": len(chunks), "state": state_stage.get("status", "pending") if isinstance(state_stage, dict) else "pending"}
+    result["partials"] = [str(path) for path in (root / "translation").glob("chunk_*_partial.json") if path.is_file()]
+    result["repairable"] = any(item["done"] for item in result["stages"].values())
+    return result
 
 
 def safe_filename(name: str, fallback: str = "file") -> str:

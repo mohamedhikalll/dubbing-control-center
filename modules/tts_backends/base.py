@@ -2,7 +2,7 @@ import os
 from abc import ABC, abstractmethod
 
 class TTSBackend(ABC):
-    """Abstract base class for all TTS backends in ZastTranslate."""
+    """Abstract base class for all TTS backends in Dubbing Control Center."""
     
     def __init__(self):
         self.model = None

@@ -247,7 +247,8 @@ ABSOLUTE RULES:
         return None
 
     def translate_segments(self, segments, source_lang, target_lang_name, 
-                           target_lang_code, cps, speed_factor=1.15):
+                           target_lang_code, cps, speed_factor=1.15,
+                           progress_callback=None):
         """
         Translate all segments with brutal concision for timing.
         Uses GPU-batched inference (BATCH_SIZE=8) for ~5-8x speedup on 4090.
@@ -285,6 +286,8 @@ ABSOLUTE RULES:
                 text = seg.get("text", "").strip()
                 if not text:
                     seg["translated_text"] = ""
+                    continue
+                if str(seg.get("translated_text", "")).strip():
                     continue
 
                 duration = seg["end"] - seg["start"]
@@ -342,6 +345,8 @@ ABSOLUTE RULES:
 
             done = min(batch_start + BATCH_SIZE, len(segments))
             print(f"  {done}/{len(segments)} segments translated")
+            if progress_callback:
+                progress_callback(segments)
 
         print(f"Translation complete: {len(segments)} segments")
         return segments
@@ -362,7 +367,8 @@ Source: "{text}"
         ]
         return messages, max(30, int(len(text) * 2))
 
-    def translate_normal(self, segments, source_lang, target_lang_code):
+    def translate_normal(self, segments, source_lang, target_lang_code,
+                         progress_callback=None):
         """
         Translate all segments naturally without any length constraint.
         Produces a faithful, full translation (no shortening, no concision).
@@ -393,6 +399,8 @@ Source: "{text}"
                 text = seg.get("text", "").strip()
                 if not text:
                     seg["normal_text"] = ""
+                    continue
+                if str(seg.get("normal_text", "")).strip():
                     continue
                 if same_lang:
                     seg["normal_text"] = text
@@ -434,6 +442,8 @@ Source: "{text}"
 
             done = min(batch_start + BATCH_SIZE, len(segments))
             print(f"  {done}/{len(segments)} segments translated (normal)")
+            if progress_callback:
+                progress_callback(segments)
 
         print(f"Normal translation complete: {len(segments)} segments")
         return segments

@@ -40,14 +40,41 @@ class VoxCPM2Backend(TTSBackend):
             return
         
         self.default_ref_audio = ref_audio_path
-        requested_device = os.environ.get("ZAST_TTS_DEVICE", "").strip().lower()
+        requested_device = os.environ.get("DUBBING_TTS_DEVICE", "").strip().lower()
         self.device = requested_device if requested_device in ("cpu", "cuda", "cuda:0") else DEVICE
         
-        load_denoiser = os.environ.get("ZAST_LOAD_DENOISER", "0").strip().lower() in {"1", "true", "yes", "on"}
+        load_denoiser = os.environ.get("DUBBING_LOAD_DENOISER", "0").strip().lower() in {"1", "true", "yes", "on"}
         print(f"Loading VoxCPM 2 Backend (ZipEnhancer={'enabled' if load_denoiser else 'disabled'})...")
+        # Another backend may have imported huggingface_hub before this point.
+        # Re-assert the project cache so VoxCPM does not use an incomplete
+        # default Windows cache snapshot.
+        hf_home = os.path.expanduser("~/.dubbing-control-center/models")
+        hf_hub_cache = os.path.join(hf_home, "hub")
+        os.environ["HF_HOME"] = hf_home
+        os.environ["HF_HUB_CACHE"] = hf_hub_cache
+        os.environ["HUGGINGFACE_HUB_CACHE"] = hf_hub_cache
+        try:
+            import huggingface_hub.constants as hf_constants
+            hf_constants.HF_HOME = hf_home
+            hf_constants.HF_HUB_CACHE = hf_hub_cache
+        except (ImportError, AttributeError):
+            pass
         from voxcpm import VoxCPM
         # ZipEnhancer is optional and may require an unavailable offline ModelScope cache.
-        self.model = VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=load_denoiser, device=self.device, optimize=(self.device != "cpu"))
+        model_source = "openbmb/VoxCPM2"
+        snapshot_root = os.path.join(hf_hub_cache, "models--openbmb--VoxCPM2", "snapshots")
+        complete_snapshots = []
+        if os.path.isdir(snapshot_root):
+            for entry in os.scandir(snapshot_root):
+                if not entry.is_dir():
+                    continue
+                required = ("config.json", "model.safetensors", "audiovae.pth")
+                if all(os.path.isfile(os.path.join(entry.path, name)) for name in required):
+                    complete_snapshots.append(entry.path)
+        if complete_snapshots:
+            model_source = max(complete_snapshots, key=os.path.getmtime)
+            print(f"VoxCPM 2: using complete local snapshot: {model_source}")
+        self.model = VoxCPM.from_pretrained(model_source, load_denoiser=load_denoiser, cache_dir=hf_hub_cache, device=self.device, optimize=(self.device != "cpu"))
         # Get actual sample rate from the underlying model
         self._sample_rate = getattr(self.model.tts_model, 'sample_rate', 24000)
         print(f"VoxCPM 2 sample rate: {self._sample_rate}")

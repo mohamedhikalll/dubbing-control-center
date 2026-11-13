@@ -107,6 +107,7 @@ class BatchTranslator:
     def translate_segments(
         self,
         segments: list[dict[str, Any]],
+        progress_callback=None,
     ) -> list[dict[str, Any]]:
         self.load()
 
@@ -125,6 +126,7 @@ class BatchTranslator:
             self.target_lang_code,
             cps=self.cps,
             speed_factor=self.speed_factor,
+            progress_callback=(lambda value: progress_callback("fitted", value)) if progress_callback else None,
         )
 
         # نفس منطق التطبيق الحالي:
@@ -186,6 +188,7 @@ class BatchTranslator:
             translated_segments,
             self.source_lang,
             self.target_lang_code,
+            progress_callback=(lambda value: progress_callback("normal", value)) if progress_callback else None,
         )
 
         # نعيد fitted_text إلى نفس السجل النهائي.
@@ -300,7 +303,24 @@ def run_translation_stage(
     results: list[dict[str, Any]] = []
 
     try:
-        for chunk in manifest:
+        resume_index = 0
+        for index, chunk in enumerate(manifest):
+            translation_json = job.path_for_chunk(job.translation_dir, chunk.number, ".json")
+            normal_srt = job.translation_dir / f"chunk_{chunk.number:03d}_normal.srt"
+            fitted_srt = job.translation_dir / f"chunk_{chunk.number:03d}_fitted.srt"
+            state = job.get_chunk_state(chunk.number)
+            if state.get("translation_status") == "completed" and _valid_translation_artifacts(translation_json, normal_srt, fitted_srt, state.get("translated_segment_count")):
+                resume_index = index + 1
+                continue
+            break
+        if resume_index:
+            if resume_index == len(manifest):
+                print(f"[RESUME] All {resume_index} translation chunks are complete; skipping translation.")
+                job.finish_stage("translate")
+                return results
+            print(f"[RESUME] Skipping {resume_index} completed translation chunk(s); resuming at chunk {manifest[resume_index].number:03d}.")
+
+        for chunk in manifest[resume_index:]:
             transcription_json = job.path_for_chunk(
                 job.transcription_dir,
                 chunk.number,
@@ -361,8 +381,27 @@ def run_translation_stage(
                     transcription
                 )
 
+                partial_path = job.translation_dir / f"chunk_{chunk.number:03d}_partial.json"
+                try:
+                    partial = _read_json(partial_path)
+                    saved_segments = partial.get("segments", [])
+                    if isinstance(saved_segments, list) and len(saved_segments) == len(source_segments):
+                        source_segments = [dict(item) for item in saved_segments]
+                        print(f"[RESUME] Chunk {chunk.number:03d}: resuming translation from saved segment batches.")
+                except (OSError, UnicodeError, json.JSONDecodeError, AttributeError, TypeError):
+                    pass
+
+                def save_translation_progress(phase: str, segments: list[dict[str, Any]]) -> None:
+                    _write_json(partial_path, {
+                        "chunk_number": chunk.number,
+                        "phase": phase,
+                        "segment_count": len(segments),
+                        "segments": segments,
+                    })
+
                 translated_segments = translator.translate_segments(
-                    source_segments
+                    source_segments,
+                    progress_callback=save_translation_progress,
                 )
 
                 payload = {
@@ -385,6 +424,7 @@ def run_translation_stage(
                     fitted_srt,
                     target_lang_code,
                 )
+                partial_path.unlink(missing_ok=True)
 
                 job.set_chunk_state(
                     chunk.number,

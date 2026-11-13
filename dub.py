@@ -318,8 +318,8 @@ def main() -> int:
         raise SystemExit("ERROR: --task srt_dub requires --external-srt.")
     if not 1.0 <= args.max_speed <= 2.5:
         raise SystemExit("ERROR: --max-speed must be between 1.0 and 2.5.")
-    os.environ["ZAST_DEVICE"] = args.device
-    os.environ["ZAST_TTS_DEVICE"] = args.device
+    os.environ["DUBBING_DEVICE"] = args.device
+    os.environ["DUBBING_TTS_DEVICE"] = args.device
     import config as app_config
     if args.device == "cuda" and not app_config.torch.cuda.is_available():
         raise SystemExit("ERROR: CUDA was requested but torch.cuda.is_available() is False.")
@@ -332,12 +332,13 @@ def main() -> int:
             module.DEVICE = args.device
     time_sync_module.MAX_SPEED_FACTOR = args.max_speed
 
-    workspace = Path(os.environ.get("ZAST_WORK_DIR", str(source.parent / f"{source.stem}_dubbing"))).resolve()
+    workspace = Path(os.environ.get("DUBBING_WORK_DIR", str(source.parent / f"{source.stem}_dubbing"))).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
     for name in ("status", "config", "chunks", "transcription", "translation", "separated", "dubbing", "temp", "logs", "final"):
         (workspace / name).mkdir(parents=True, exist_ok=True)
     state_file = workspace / "status" / "job_state.json"
     job = JobContext(workspace.parent, job_id=workspace.name, create=not state_file.exists())
+    job.reconcile_interrupted()
     job.set_settings(source=str(source), target_language=args.target_language, target_code=args.target_code,
                      llm=args.llm, whisper=args.whisper, device=args.device, gender=args.gender,
                      output=args.output, reference_audio=args.reference_audio, max_speed=args.max_speed,
@@ -399,6 +400,9 @@ def main() -> int:
         translation_valid = _valid_translation_checkpoint(job, chunks)
     if job.is_stage_completed("transcribe") and not transcription_valid:
         state = job.load_state(); state["stages"]["transcribe"].update(status="pending", finished_at=None, error=None); job.save_state(state)
+    elif transcription_valid and not job.is_stage_completed("transcribe"):
+        job.log("[RESUME] Valid transcription artifacts found; marking transcribe complete without rerunning the model.")
+        job.finish_stage("transcribe")
     if args.task in {"full", "transcribe"}:
         if not job.is_stage_completed("transcribe") or not transcription_valid:
             run_transcription_stage(job, model_size=args.whisper, batch_size=args.whisper_batch_size, language=lang, initial_prompt=source.stem)
@@ -433,6 +437,9 @@ def main() -> int:
     if args.task in {"full", "translate", "translate_srt", "bilingual_srt"}:
         if job.is_stage_completed("translate") and not translation_valid:
             state = job.load_state(); state["stages"]["translate"].update(status="pending", finished_at=None, error=None); job.save_state(state)
+        elif translation_valid and not job.is_stage_completed("translate"):
+            job.log("[RESUME] Valid translation artifacts found; marking translate complete without rerunning the model.")
+            job.finish_stage("translate")
         if not job.is_stage_completed("translate") or not translation_valid:
             run_translation_stage(job, backend_name=args.llm, source_lang=effective_source_lang or "en", target_lang_name=args.target_language,
                                   target_lang_code=args.target_code, speed_factor=args.max_speed)
@@ -454,7 +461,7 @@ def main() -> int:
         selected_cues = write_full_srt(job, final / f"{source.stem}_arabic.srt", selected_key)
         if selected_cues <= 0:
             raise RuntimeError(f"Selected {args.text_mode} translation contains no SRT cues.")
-        job.update_state(status="partial", current_stage=None, last_task="translate")
+        job.update_state(status="partial", current_stage=None, last_task=args.task)
         print(f"Translation ready. Selected text: {args.text_mode if args.text_mode != 'auto' else 'normal'}")
         print(f"Selected Arabic SRT: {final / (source.stem + '_arabic.srt')}")
         print(f"Bilingual EN/AR SRT: {final / (source.stem + '_bilingual_en_ar.srt')}")

@@ -46,7 +46,7 @@ class LlamaCppBackend(LLMBackend):
         import llama_cpp
         print(f"Loading GGUF/C++ LLM ({self.name} - {self.repo_id}/{self.filename})...")
         
-        models_dir = os.path.expanduser("~/.zasttranslate/models/gguf")
+        models_dir = os.path.expanduser("~/.dubbing-control-center/models/gguf")
         os.makedirs(models_dir, exist_ok=True)
         
         # Calculate GPU layers: -1 for all layers on GPU if CUDA

@@ -295,7 +295,23 @@ def run_transcription_stage(
     results: list[dict[str, Any]] = []
 
     try:
-        for chunk in manifest:
+        resume_index = 0
+        for index, chunk in enumerate(manifest):
+            srt_path = job.path_for_chunk(job.transcription_dir, chunk.number, ".srt")
+            json_path = job.path_for_chunk(job.transcription_dir, chunk.number, ".json")
+            state = job.get_chunk_state(chunk.number)
+            if state.get("transcription_status") == "completed" and _valid_transcription_artifacts(json_path, srt_path, state.get("segment_count")):
+                resume_index = index + 1
+                continue
+            break
+        if resume_index:
+            if resume_index == len(manifest):
+                print(f"[RESUME] All {resume_index} transcription chunks are complete; skipping transcription.")
+                job.finish_stage("transcribe")
+                return results
+            print(f"[RESUME] Skipping {resume_index} completed transcription chunk(s); resuming at chunk {manifest[resume_index].number:03d}.")
+
+        for chunk in manifest[resume_index:]:
             srt_path = job.path_for_chunk(
                 job.transcription_dir,
                 chunk.number,

@@ -172,7 +172,7 @@ def split_long_segments(segments, max_duration=8.0, max_chars=75, min_words=MIN_
     return new_segments
 
 DEFAULT_INITIAL_PROMPT = (
-    "ZastTranslate, Pinokio, WhisperX, large-v3, Qwen, Qwen3.5-9B, VoxCPM 2, "
+    "Dubbing Control Center, Pinokio, WhisperX, large-v3, Qwen, Qwen3.5-9B, VoxCPM 2, "
     "FLUX.1-schnell, Fitted, Bulk Mode, Translation et Dubbing, Blog Studio, "
     "Clean Fillers, 16:9, 9:16, longues traînes, tics IA, Demucs, pyannote, Ollama, vLLM, "
     "Claude, Claude.ai, ChatGPT, OpenAI, GPT-4, DeepSeek, PyTorch, LoRA, ElevenLabs, "
