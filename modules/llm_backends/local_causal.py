@@ -1,8 +1,25 @@
-﻿import torch
+import torch
 import gc
+from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from .base import LLMBackend
 from config import DEVICE
+from modules.cache_paths import hf_snapshots, transformers_weights_complete
+
+
+def _local_hf_model_path(model_id: str) -> str:
+    """Resolve a complete local Transformers snapshot across current and legacy caches."""
+    if Path(model_id).expanduser().is_dir():
+        return str(Path(model_id).expanduser().resolve())
+    candidates = []
+    for snapshot in hf_snapshots(model_id):
+        if not (snapshot / "config.json").is_file() or not (snapshot / "tokenizer.json").is_file():
+            continue
+        if transformers_weights_complete(snapshot):
+            candidates.append(snapshot)
+    if not candidates:
+        return model_id
+    return str(max(candidates, key=lambda path: path.stat().st_mtime))
 
 class LocalCausalLMBackend(LLMBackend):
     def __init__(self, name: str, model_id: str, capabilities: dict):
@@ -33,8 +50,13 @@ class LocalCausalLMBackend(LLMBackend):
         if self.model is not None:
             return
             
+        model_source = _local_hf_model_path(self.model_id)
+        if model_source != self.model_id:
+            print(f"[LLM] Using local snapshot: {model_source}")
+        else:
+            print(f"[LLM] Local snapshot not found; Hub access may be required: {self.model_id}")
         print(f"Loading Translation LLM ({self.name} - {self.model_id})...")
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_source, local_files_only=model_source != self.model_id)
         
         if self.device == "cuda":
             # 4-bit quantization: ~4.5GB GPU instead of ~18GB, keeps everything on GPU (faster than CPU offload)
@@ -45,20 +67,22 @@ class LocalCausalLMBackend(LLMBackend):
                 bnb_4bit_quant_type="nf4",
             )
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_id,
+                model_source,
                 quantization_config=bnb_config,
                 device_map="cuda",
                 attn_implementation="eager",
+                local_files_only=model_source != self.model_id,
             )
             # Re-enable TF32 (pyannote disables it during transcription)
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_id,
+                model_source,
                 torch_dtype=torch.float32,
                 device_map="cpu",
                 attn_implementation="eager",
+                local_files_only=model_source != self.model_id,
             )
 
     def unload(self):

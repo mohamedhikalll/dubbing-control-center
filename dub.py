@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -22,6 +25,172 @@ import modules.time_sync as time_sync_module
 
 SOURCE_MAP = {"auto": None, "en": "en", "fr": "fr", "es": "es", "de": "de", "it": "it", "pt": "pt", "ja": "ja", "ko": "ko", "zh": "zh", "ru": "ru", "ar": "ar", "hi": "hi"}
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".opus"}
+
+
+def _configure_utf8_stdio() -> None:
+    """Keep Windows console output from failing on Arabic/full-width symbols."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
+
+def _profile_settings(args) -> dict:
+    """Return settings that determine whether pipeline artifacts are reusable."""
+    reference = str(Path(args.reference_audio).expanduser().resolve()) if args.reference_audio else ""
+    return {
+        "target_language": str(args.target_language or "").strip().lower(),
+        "target_code": str(args.target_code or "").strip().lower(),
+        "gender": str(args.gender or "").strip().lower(),
+        "reference_audio": reference.casefold(),
+        "text_mode": str(args.text_mode or "normal").strip().lower(),
+        "max_speed": float(args.max_speed),
+        "llm": str(args.llm or "").strip().lower(),
+        "whisper": str(args.whisper or "").strip().lower(),
+        "source_language": str(args.source_language or "").strip().lower(),
+        "split_mode": str(args.split_mode or "auto").strip().lower(),
+        "split_threshold_seconds": float(args.split_threshold_seconds),
+        "chunk_minutes": float(args.chunk_minutes),
+        "search_window": float(args.search_window),
+    }
+
+
+def _safe_profile_part(value: str, fallback: str = "profile") -> str:
+    value = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value)).strip("._-")
+    return (value[:42] or fallback)
+
+
+def _read_profile(workspace: Path) -> dict:
+    path = workspace / "status" / "job_state.json"
+    if not path.is_file():
+        return {}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        return dict(state.get("settings") or {})
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _profile_matches(existing: dict, requested: dict, *, include_voice: bool, include_language: bool) -> bool:
+    if not existing:
+        return False
+    keys = ["llm", "whisper", "source_language", "split_mode", "split_threshold_seconds", "chunk_minutes", "search_window"]
+    if include_language:
+        keys += ["target_language", "target_code"]
+    if include_voice:
+        keys += ["gender", "reference_audio", "text_mode", "max_speed"]
+    for key in keys:
+        if str(existing.get(key, "")).strip().lower() != str(requested.get(key, "")).strip().lower():
+            return False
+    return True
+
+
+def _link_or_copy(src: str, dst: str) -> None:
+    try:
+        os.link(src, dst)
+    except (OSError, NotImplementedError):
+        shutil.copy2(src, dst)
+
+
+def _clone_tree(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    shutil.copytree(src, dst, copy_function=_link_or_copy, dirs_exist_ok=True)
+
+
+def _rewrite_json_paths(root: Path, old: Path, new: Path) -> None:
+    old_text = str(old)
+    for path in root.rglob("*.json"):
+        try:
+            text = path.read_text(encoding="utf-8")
+            rewritten = text.replace(old_text, str(new))
+            if rewritten != text:
+                path.write_text(rewritten, encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+
+
+def _workspace_candidates(source: Path, base: Path) -> list[Path]:
+    prefix = f"{source.stem}_dubbing"
+    candidates = [p for p in source.parent.glob(prefix + "*") if p.is_dir()]
+    if base.is_dir() and base not in candidates:
+        candidates.insert(0, base)
+    return sorted(candidates, key=lambda p: (p != base, p.name.casefold()))
+
+
+def _prepare_profile_workspace(source: Path, base: Path, args, task: str) -> Path:
+    """Select an existing profile or create a side-by-side profile workspace.
+
+    Shared artifacts are hard-linked when possible, so a new voice/language does
+    not duplicate large audio files. The new profile gets its own state/final
+    output and therefore can never overwrite an older result.
+    """
+    requested = _profile_settings(args)
+    candidates = _workspace_candidates(source, base)
+    exact = next((p for p in candidates if _profile_matches(_read_profile(p), requested, include_voice=True, include_language=True)), None)
+    if exact:
+        return exact
+    if task in {"transcribe", "split"}:
+        return base
+
+    # A voice change must stay in the same workspace/final folder. Dubbing
+    # artifacts are isolated by voice below, while transcript/translation data
+    # remains reusable. A language change may still need its own profile.
+    language_match = next((p for p in candidates if _profile_matches(_read_profile(p), requested, include_voice=False, include_language=True)), None)
+    if language_match is not None:
+        return language_match
+
+    source_match = next((p for p in candidates if _read_profile(p)), None)
+    parent = language_match or source_match or (base if (base / "status" / "job_state.json").is_file() else None)
+    reuse_translation = language_match is not None
+    if parent is None:
+        return base
+
+    lang = _safe_profile_part(args.target_language, "Language")
+    voice = _safe_profile_part(args.gender, "Voice")
+    digest = hashlib.sha1(json.dumps(requested, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:8]
+    prefix = f"{source.stem}_dubbing__{lang}_{voice}"
+    number = 2
+    while True:
+        destination = source.parent / f"{prefix}_v{number}_{digest}"
+        if not destination.exists():
+            break
+        number += 1
+    destination.mkdir(parents=True, exist_ok=False)
+    for name in ("chunks", "transcription", "separated", "status"):
+        _clone_tree(parent / name, destination / name)
+    if reuse_translation:
+        _clone_tree(parent / "translation", destination / "translation")
+    for name in ("config", "dubbing", "temp", "logs", "final"):
+        (destination / name).mkdir(parents=True, exist_ok=True)
+    _rewrite_json_paths(destination, parent, destination)
+
+    state_path = destination / "status" / "job_state.json"
+    if state_path.is_file():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    else:
+        state = {"stages": {}, "chunks": {}}
+    state.setdefault("stages", {})
+    for stage in ("split", "transcribe", "translate", "separate", "dub", "assemble", "package"):
+        state["stages"].setdefault(stage, {"status": "pending"})
+    for stage in ("split", "transcribe", "separate"):
+        state["stages"][stage].update(status="completed", error=None)
+    state["stages"]["translate"].update(status="completed" if reuse_translation else "pending", error=None)
+    for stage in ("dub", "assemble", "package"):
+        state["stages"][stage].update(status="pending", started_at=None, finished_at=None, error=None)
+    state["status"] = "partial"
+    state["current_stage"] = None
+    state["settings"] = requested
+    state["settings"]["profile_parent"] = str(parent)
+    state["settings"]["profile_version"] = number
+    state["source"] = state.get("source", {})
+    state["source"]["input_path"] = str(source)
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    (destination / "config" / "settings.json").write_text(json.dumps(vars(args), ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    print(f"[VERSIONING] New profile v{number}: {destination}")
+    print(f"[VERSIONING] Reused split/transcription/separation; translation={'reused' if reuse_translation else 'will be generated'}")
+    return destination
 
 
 def timestamp(seconds: float) -> str:
@@ -286,6 +455,7 @@ def write_used_srt_and_report(job, source: Path, final_dir: Path, elapsed: float
 
 
 def main() -> int:
+    _configure_utf8_stdio()
     p = argparse.ArgumentParser(description="Local-file dubbing pipeline")
     p.add_argument("input", help="Local input video or audio path")
     p.add_argument("--source-language", default="auto", choices=list(SOURCE_MAP))
@@ -332,13 +502,21 @@ def main() -> int:
             module.DEVICE = args.device
     time_sync_module.MAX_SPEED_FACTOR = args.max_speed
 
-    workspace = Path(os.environ.get("DUBBING_WORK_DIR", str(source.parent / f"{source.stem}_dubbing"))).resolve()
+    base_workspace = Path(os.environ.get("DUBBING_WORK_DIR", str(source.parent / f"{source.stem}_dubbing"))).resolve()
+    workspace = _prepare_profile_workspace(source, base_workspace, args, args.task)
+    workspace = workspace.resolve()
     workspace.mkdir(parents=True, exist_ok=True)
     for name in ("status", "config", "chunks", "transcription", "translation", "separated", "dubbing", "temp", "logs", "final"):
         (workspace / name).mkdir(parents=True, exist_ok=True)
     state_file = workspace / "status" / "job_state.json"
     job = JobContext(workspace.parent, job_id=workspace.name, create=not state_file.exists())
     job.reconcile_interrupted()
+    # Keep multiple voice renders in one project without reusing another voice's
+    # chunk audio or overwriting the prior final audio/video.
+    voice_key = json.dumps({"gender": args.gender, "reference_audio": _profile_settings(args)["reference_audio"], "text_mode": args.text_mode, "max_speed": args.max_speed}, sort_keys=True, ensure_ascii=False)
+    voice_suffix = hashlib.sha1(voice_key.encode("utf-8")).hexdigest()[:8]
+    job.dubbing_dir = job.root / "dubbing" / f"voice_{_safe_profile_part(args.gender, 'Voice')}_{voice_suffix}"
+    job.dubbing_dir.mkdir(parents=True, exist_ok=True)
     job.set_settings(source=str(source), target_language=args.target_language, target_code=args.target_code,
                      llm=args.llm, whisper=args.whisper, device=args.device, gender=args.gender,
                      output=args.output, reference_audio=args.reference_audio, max_speed=args.max_speed,
@@ -351,10 +529,10 @@ def main() -> int:
     split_path = job.status_dir / "chunks_manifest.json"
 
     if args.redub:
-        for directory in (job.dubbing_dir, job.final_dir):
-            if directory.exists():
-                shutil.rmtree(directory)
-            directory.mkdir(parents=True, exist_ok=True)
+        if job.dubbing_dir.exists():
+            shutil.rmtree(job.dubbing_dir)
+        job.dubbing_dir.mkdir(parents=True, exist_ok=True)
+        job.final_dir.mkdir(parents=True, exist_ok=True)
         state = job.load_state()
         for stage in ("dub", "assemble", "package"):
             if stage in state.get("stages", {}):
@@ -476,17 +654,18 @@ def main() -> int:
     mixed = [Path(x["mixed_audio"]).resolve() for x in results]
     if not mixed:
         raise RuntimeError("No dubbed audio chunks were produced.")
+    job.start_stage("assemble")
     concat = final / "audio_concat.txt"
     concat.write_text("\n".join("file '" + str(x).replace("'", "'\\''").replace("\\", "/") + "'" for x in mixed) + "\n", encoding="utf-8")
-    final_audio = final / f"{source.stem}_dubbed.m4a"
+    final_audio = final / f"{source.stem}_dubbed_{_safe_profile_part(args.gender, 'Voice')}_{voice_suffix}.m4a"
     subprocess.run(["ffmpeg", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", str(concat), "-c:a", "aac", "-b:a", "192k", str(final_audio)], check=True)
     if args.output == "video" and source.suffix.lower() not in AUDIO_EXT:
-        final_video = final / f"{source.stem}_dubbed.mp4"
+        final_video = final / f"{source.stem}_dubbed_{_safe_profile_part(args.gender, 'Voice')}_{voice_suffix}.mp4"
         VideoAssembler().assemble(str(source), str(final_audio), str(final_video))
     report = write_used_srt_and_report(job, source, final, time.perf_counter() - run_started)
     if report["segments"] <= 0 or (final / f"{source.stem}_arabic.srt").stat().st_size <= 0:
         raise RuntimeError("Arabic/used SRT validation failed: no spoken segment text was recorded.")
-    expected_video = final / f"{source.stem}_dubbed.mp4"
+    expected_video = final / f"{source.stem}_dubbed_{_safe_profile_part(args.gender, 'Voice')}_{voice_suffix}.mp4"
     actual_output = expected_video if args.output == "video" and source.suffix.lower() not in AUDIO_EXT else final_audio
     if not actual_output.is_file() or actual_output.stat().st_size <= 0:
         raise RuntimeError(f"Final output is missing or empty: {actual_output}")
@@ -505,6 +684,7 @@ def main() -> int:
                                 "text_mode": args.text_mode, "task": args.task, "whisper_batch_size": args.whisper_batch_size,
                                 "reference_audio": args.reference_audio}})
     (final / "dubbing_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    job.finish_stage("assemble")
     job.mark_completed()
     temporary_audio_dirs = [job.temp_dir, *job.dubbing_dir.glob("chunk_*/timesync_temp")]
     for temporary_dir in temporary_audio_dirs:
@@ -513,7 +693,7 @@ def main() -> int:
     print("[CLEANUP] Removed temporary Demucs/TTS cache files; source chunks, transcripts, translations, manifests, and final outputs were kept.")
     print(f"Completed audio: {final_audio}")
     if args.output == "video" and source.suffix.lower() not in AUDIO_EXT:
-        print(f"Completed video: {final / (source.stem + '_dubbed.mp4')}")
+        print(f"Completed video: {final / (source.stem + '_dubbed_' + _safe_profile_part(args.gender, 'Voice') + '_' + voice_suffix + '.mp4')}")
     print(f"Final folder: {final}")
     return 0
 

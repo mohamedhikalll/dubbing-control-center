@@ -515,7 +515,7 @@ def run(s):
 def main():
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
-            try: stream.reconfigure(errors="backslashreplace")
+            try: stream.reconfigure(encoding="utf-8", errors="replace")
             except (OSError, ValueError): pass
     s=defaults()
     while True:

@@ -1,5 +1,11 @@
 @echo off
 setlocal
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8:backslashreplace"
+if /I "%DUBBING_OFFLINE%"=="1" (
+    set "HF_HUB_OFFLINE=1"
+    set "TRANSFORMERS_OFFLINE=1"
+)
 if /I "%~1"=="--open" goto OPEN
 if /I "%~1"=="--tui" goto OPEN
 if not exist "%~dp0env\Scripts\python.exe" (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import ctypes
 import os
 import re
 import tempfile
@@ -182,11 +183,13 @@ class JobContext:
                 "started_at": self._now(),
                 "finished_at": None,
                 "error": None,
+                "interrupted_at": None,
             }
         )
 
         state["status"] = "running"
         state["current_stage"] = stage
+        state["worker_pid"] = os.getpid()
         self.save_state(state)
         self.log(f"[STAGE START] {stage}")
 
@@ -200,6 +203,7 @@ class JobContext:
                 "status": "completed",
                 "finished_at": self._now(),
                 "error": None,
+                "interrupted_at": None,
             }
         )
 
@@ -217,6 +221,7 @@ class JobContext:
                 "status": "failed",
                 "finished_at": self._now(),
                 "error": str(error),
+                "interrupted_at": None,
             }
         )
 
@@ -290,11 +295,13 @@ class JobContext:
         print(line, end="", flush=True)
 
     def mark_completed(self) -> None:
-        self.update_state(
-            status="completed",
-            current_stage=None,
-            completed_at=self._now(),
-        )
+        state = self.load_state()
+        for optional_stage in ("download", "package"):
+            stage_state = state.setdefault("stages", {}).setdefault(optional_stage, {})
+            if stage_state.get("status") == "pending":
+                stage_state.update(status="skipped", finished_at=self._now(), error=None)
+        state.update(status="completed", current_stage=None, worker_pid=None, completed_at=self._now())
+        self.save_state(state)
         self.log("[JOB DONE]")
 
     def mark_failed(self, error: Exception | str) -> None:
@@ -305,10 +312,49 @@ class JobContext:
         )
         self.log(f"[JOB FAILED] {error}")
 
+    @staticmethod
+    def _pid_is_running(pid: Any) -> bool:
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            try:
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+                kernel32.OpenProcess.restype = ctypes.c_void_p
+                handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+                if handle:
+                    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+                    kernel32.CloseHandle(handle)
+                    return True
+                return ctypes.get_last_error() not in {87, 1168}  # invalid PID / not found
+            except Exception:
+                return True  # uncertain process state must never trigger a destructive repair
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return True
+
     def reconcile_interrupted(self) -> dict[str, Any]:
         """Convert stale running states to interrupted before a safe resume."""
         state = self.load_state()
+        if state.get("status") in {"completed", "failed"}:
+            return state
+        worker_pid = state.get("worker_pid")
+        if worker_pid and self._pid_is_running(worker_pid):
+            return state
         changed = False
+        if worker_pid:
+            state["worker_pid"] = None
+            changed = True
         for stage_state in state.get("stages", {}).values():
             if isinstance(stage_state, dict) and stage_state.get("status") == "running":
                 stage_state["status"] = "interrupted"
@@ -324,6 +370,10 @@ class JobContext:
                     if key.endswith("_status") and value == "running":
                         chunk_state[key] = "interrupted"
                 changed = True
+        current_stage = state.get("current_stage")
+        if current_stage and state.get("stages", {}).get(current_stage, {}).get("status") == "interrupted":
+            state["current_stage"] = None
+            changed = True
         if changed:
             state["status"] = "partial"
             self.save_state(state)

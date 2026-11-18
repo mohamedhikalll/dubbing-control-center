@@ -1,5 +1,11 @@
 @echo off
 setlocal
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8:backslashreplace"
+if /I "%DUBBING_OFFLINE%"=="1" (
+  set "HF_HUB_OFFLINE=1"
+  set "TRANSFORMERS_OFFLINE=1"
+)
 set "COLS=%~1"
 set "LINES=%~2"
 if "%COLS%"=="" set "COLS=110"

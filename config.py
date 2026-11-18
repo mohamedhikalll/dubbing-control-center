@@ -8,6 +8,16 @@ APP_VERSION = "1.20"
 # Chemins
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _USER_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "dubbing-control-center")
+_LEGACY_ENV_ALIASES = {
+    "ZAST_WORK_DIR": "DUBBING_WORK_DIR",
+    "ZAST_TEMP_DIR": "DUBBING_TEMP_DIR",
+    "ZAST_OUTPUT_DIR": "DUBBING_OUTPUT_DIR",
+    "ZAST_DEVICE": "DUBBING_DEVICE",
+    "ZAST_TTS_DEVICE": "DUBBING_TTS_DEVICE",
+}
+for _legacy_name, _current_name in _LEGACY_ENV_ALIASES.items():
+    if os.environ.get(_legacy_name) and not os.environ.get(_current_name):
+        print(f"[WARN] Ignoring legacy {_legacy_name}; set {_current_name} only if that path/device is intended.")
 _JOB_ROOT = os.environ.get("DUBBING_WORK_DIR")
 TEMP_DIR = os.environ.get("DUBBING_TEMP_DIR", os.path.join(_JOB_ROOT, "temp") if _JOB_ROOT else os.path.join(_USER_CACHE, "temp"))
 OUTPUT_DIR = os.environ.get("DUBBING_OUTPUT_DIR", os.path.join(_JOB_ROOT, "final") if _JOB_ROOT else os.path.join(_USER_CACHE, "output"))

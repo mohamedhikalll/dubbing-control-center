@@ -18,6 +18,7 @@ from modules.process_control import terminate_process_tree, install_console_clos
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
+from modules.cache_paths import hf_cache_paths, hf_hub_search_roots, hf_snapshots
 
 
 def _load_tts_factory():
@@ -55,7 +56,7 @@ def get_backend_catalog(language: str | None = None):
     return None
 
 BASE = Path(__file__).resolve().parent
-from long_video_pipeline.job_manager import inspect_job_artifacts
+from long_video_pipeline.job_manager import JobContext, inspect_job_artifacts
 PROFILE_FILE = BASE / "profiles.json"
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".opus"}
 VIDEO_EXT = {".mp4", ".mkv", ".mov", ".avi", ".wmv", ".webm", ".m4v", ".mpeg", ".mpg", ".ts", ".m2ts", ".3gp", ".flv"}
@@ -82,6 +83,36 @@ def _save_profile(name: str, values: dict) -> None:
 
 def _workspace(source: Path) -> Path:
     return source.parent / f"{source.stem}_dubbing"
+
+
+def _workspace_matches_args(workspace: Path, args: argparse.Namespace | None) -> bool:
+    """The base checkpoint is reusable only when its profile matches the request."""
+    if args is None:
+        return True
+    state_path = workspace / "status" / "job_state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        settings = state.get("settings", {})
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return not state_path.exists()
+    requested = {
+        "target_language": args.target_language,
+        "target_code": args.target_code,
+        "gender": args.gender,
+        "reference_audio": str(Path(args.reference_audio).expanduser().resolve()) if args.reference_audio else "",
+        "text_mode": args.text_mode,
+        "max_speed": args.max_speed,
+        "llm": args.llm,
+        "whisper": args.whisper,
+        "source_language": args.source_language,
+    }
+    for key, value in requested.items():
+        existing = settings.get(key, "")
+        if key == "reference_audio":
+            existing = str(existing or "")
+        if str(existing).strip().casefold() != str(value).strip().casefold():
+            return False
+    return True
 
 
 def _resume_summary(source: Path, task: str) -> dict:
@@ -131,7 +162,9 @@ def _resume_summary(source: Path, task: str) -> dict:
     return summary
 
 
-def _operation_complete(source: Path, task: str) -> bool:
+def _operation_complete(source: Path, task: str, args: argparse.Namespace | None = None) -> bool:
+    if not _workspace_matches_args(_workspace(source), args):
+        return False
     summary = _resume_summary(source, task)
     if not summary["exists"]:
         return False
@@ -283,22 +316,60 @@ def _check_whisper_cache(model_name: str) -> None:
             print(f"[WARN] Whisper local model is incomplete: {weights} is missing or empty.")
         return
     repo_id = model_name if "/" in model_name else f"Systran/faster-whisper-{model_name}"
-    try:
-        from huggingface_hub import snapshot_download
-        snapshot_download(repo_id=repo_id, local_files_only=True)
-        print(f"Whisper model cache: complete ({repo_id})")
-    except Exception as exc:
-        detail = " ".join(str(exc).split())[:320]
+    required = ("config.json", "model.bin", "tokenizer.json")
+    complete = []
+    for snapshot in hf_snapshots(repo_id):
+        if all((snapshot / name).is_file() and (snapshot / name).stat().st_size > 0 for name in required):
+            complete.append(snapshot)
+    if complete:
+        selected = max(complete, key=lambda path: path.stat().st_mtime)
+        print(f"Whisper model cache: complete local snapshot ({selected})")
+    else:
         print(
-            f"[WARN] Whisper model cache is missing/incomplete for {repo_id}; "
-            "the first transcription needs network access to finish downloading it. "
-            f"Details: {type(exc).__name__}: {detail}"
+            f"[WARN] Whisper model cache is incomplete for {repo_id}; "
+            "required files are config.json, model.bin, and tokenizer.json. "
+            "Network access is needed only if no complete local snapshot exists."
         )
+
+
+def _check_cache_paths() -> None:
+    hf_home, hf_hub = hf_cache_paths()
+    work_cache = Path.home() / ".cache" / "dubbing-control-center"
+    print(f"Dubbing work cache: {work_cache}")
+    print(f"DUBBING_WORK_DIR override: {os.environ.get('DUBBING_WORK_DIR') or '(not set)'}")
+    print(f"HF_HOME (write root): {hf_home}")
+    print(f"HF_HUB_CACHE (write cache): {hf_hub}")
+    try:
+        import torch
+        torch_hub = Path(torch.hub.get_dir())
+    except Exception:
+        torch_hub = Path(os.environ.get("TORCH_HOME", Path.home() / ".cache" / "torch")) / "hub"
+    print(f"Torch Hub cache: {torch_hub}")
+    for root in hf_hub_search_roots():
+        print(f"HF cache search root: {root} ({'present' if root.is_dir() else 'not present'})")
+    legacy_root = Path.home() / ".cache" / "zasttranslate"
+    if legacy_root.exists():
+        print(f"Legacy ZastTranslate cache (read-only fallback only): {legacy_root}")
+    for name in ("ZAST_WORK_DIR", "ZAST_TEMP_DIR", "ZAST_OUTPUT_DIR", "ZAST_DEVICE", "ZAST_TTS_DEVICE"):
+        value = os.environ.get(name)
+        if value:
+            print(f"[WARN] Legacy environment override {name} is set: {value}")
+
+    demucs_snapshots = []
+    for snapshot in hf_snapshots("adefossez/HTDemucs"):
+        weight = snapshot / "955717e8.safetensors"
+        if (snapshot / "htdemucs.yaml").is_file() and weight.is_file() and weight.stat().st_size > 0:
+            demucs_snapshots.append(snapshot)
+    if demucs_snapshots:
+        print(f"HTDemucs model: complete local snapshot ({demucs_snapshots[0]})")
+    else:
+        print("[WARN] HTDemucs model: no complete local HF snapshot found; online download may be required.")
 
 
 def _check(whisper_model: str = "large-v3") -> int:
     print("Dubbing runtime check")
     print(f"Python: {sys.version.split()[0]}")
+    _check_cache_paths()
     try:
         if os.name == "nt":
             class MEMORYSTATUSEX(ctypes.Structure):
@@ -602,7 +673,7 @@ def _run(args: argparse.Namespace) -> int:
         stopped = False
         for index, source in enumerate(sources, 1):
             source_path = Path(source).expanduser().resolve()
-            if _operation_complete(source_path, args.task):
+            if _operation_complete(source_path, args.task, args):
                 succeeded.append(source)
                 print(f"\n[BATCH SKIP {index}/{len(sources)}] {source} — operation '{args.task}' already completed; no work to do.")
                 print(f"[PROGRESS] videos_total={len(sources)} videos_completed={len(succeeded)} videos_failed={len(failed)} current_video={index} current_path={source} stage=already_completed stage_percent=100 speed=skipped remaining={len(sources) - len(succeeded) - len(failed)}", flush=True)
@@ -676,7 +747,7 @@ def _run(args: argparse.Namespace) -> int:
     if not 1.0 <= args.max_speed <= 2.5:
         raise SystemExit("ERROR: --max-speed must be between 1.0 and 2.5.")
     _print_resume_summary(source, args.task)
-    if _operation_complete(source, args.task) and not args.redub:
+    if _operation_complete(source, args.task, args) and not args.redub:
         print(f"[RESUME] Operation '{args.task}' is already complete for {source.name}; skipping all processing.", flush=True)
         return 0
 
@@ -800,11 +871,20 @@ def _run(args: argparse.Namespace) -> int:
         if code:
             return code
         if args.output_dir:
-            dest = Path(args.output_dir).expanduser().resolve()
-            dest.mkdir(parents=True, exist_ok=True)
-            for item in final.iterdir() if final.exists() else []:
-                if item.is_file():
-                    shutil.copy2(item, dest / item.name)
+            package_job = JobContext.open_existing(workspace.parent, workspace.name)
+            prior_status = package_job.load_state().get("status", "partial")
+            package_job.start_stage("package")
+            try:
+                dest = Path(args.output_dir).expanduser().resolve()
+                dest.mkdir(parents=True, exist_ok=True)
+                for item in final.iterdir() if final.exists() else []:
+                    if item.is_file():
+                        shutil.copy2(item, dest / item.name)
+                package_job.finish_stage("package")
+                package_job.update_state(status=prior_status, current_stage=None)
+            except Exception as exc:
+                package_job.fail_stage("package", exc)
+                raise
         return 0
     finally:
         remove_console_close_handler(console_handler)
@@ -815,7 +895,7 @@ def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
-                stream.reconfigure(errors="backslashreplace")
+                stream.reconfigure(encoding="utf-8", errors="replace")
             except (OSError, ValueError):
                 pass
     p = _parser()

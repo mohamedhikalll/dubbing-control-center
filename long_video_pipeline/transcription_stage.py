@@ -21,6 +21,7 @@ from modules.transcriber import (
     split_long_segments,
 )
 from modules.utils import cleanup_model
+from modules.cache_paths import hf_snapshots
 
 from .job_manager import JobContext, atomic_write_text
 from .splitter import ChunkInfo, load_manifest
@@ -35,6 +36,18 @@ def _timestamp(seconds: float) -> str:
     secs, millis = divmod(remainder, 1000)
 
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _local_whisper_snapshot(model_size: str) -> Path | None:
+    """Find a usable local faster-whisper snapshot without Hub metadata checks."""
+    if Path(model_size).expanduser().is_dir():
+        return Path(model_size).expanduser().resolve()
+    required = ("config.json", "model.bin", "tokenizer.json")
+    candidates = []
+    for snapshot in hf_snapshots(f"Systran/faster-whisper-{model_size}"):
+        if all((snapshot / name).is_file() and (snapshot / name).stat().st_size > 0 for name in required):
+            candidates.append(snapshot)
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
 
 def write_srt(segments: list[dict[str, Any]], path: str | Path) -> None:
@@ -112,12 +125,20 @@ class BatchTranscriber:
         if self.initial_prompt:
             asr_options["initial_prompt"] = self.initial_prompt
 
+        local_snapshot = _local_whisper_snapshot(self.model_size)
+        model_source = str(local_snapshot) if local_snapshot else self.model_size
+        if local_snapshot:
+            print(f"[TRANSCRIBE] Using local Whisper snapshot: {local_snapshot}")
+        else:
+            print(f"[TRANSCRIBE] Local Whisper snapshot not found; Hub download may be required: {self.model_size}")
+
         self.asr_model = whisperx.load_model(
-            self.model_size,
+            model_source,
             self.device,
             compute_type=self.compute_type,
             language=self.language,
             asr_options=asr_options,
+            local_files_only=bool(local_snapshot),
         )
 
     def _get_alignment_model(self, language_code: str):
@@ -301,6 +322,14 @@ def run_transcription_stage(
             json_path = job.path_for_chunk(job.transcription_dir, chunk.number, ".json")
             state = job.get_chunk_state(chunk.number)
             if state.get("transcription_status") == "completed" and _valid_transcription_artifacts(json_path, srt_path, state.get("segment_count")):
+                if state.get("transcription_error") is not None or state.get("interrupted_at") is not None:
+                    job.set_chunk_state(
+                        chunk.number,
+                        status="completed",
+                        transcription_status="completed",
+                        transcription_error=None,
+                        interrupted_at=None,
+                    )
                 resume_index = index + 1
                 continue
             break
@@ -343,6 +372,8 @@ def run_transcription_stage(
                 chunk.number,
                 status="transcribing",
                 transcription_status="running",
+                transcription_error=None,
+                interrupted_at=None,
                 transcription_srt=str(srt_path.resolve()),
                 transcription_json=str(json_path.resolve()),
             )
@@ -372,6 +403,8 @@ def run_transcription_stage(
                     transcription_json=str(json_path.resolve()),
                     detected_language=payload["language"],
                     segment_count=len(payload["segments"]),
+                    transcription_error=None,
+                    interrupted_at=None,
                 )
 
                 results.append({"chunk_number": chunk.number, "language": payload["language"], "segment_count": len(payload["segments"]), "reused": False})
